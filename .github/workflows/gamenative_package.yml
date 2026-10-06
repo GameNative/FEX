@@ -1,0 +1,187 @@
+name: GameNative FEXCore package
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to build'
+        required: false
+        default: ''
+      variant_name:
+        description: 'Optional label added to versionName (<base>-<variant>-<shortsha>)'
+        required: false
+        default: ''
+  pull_request:
+  push:
+    branches:
+      - gamenative-ci
+    tags:
+      - 'v*'
+
+env:
+  BUILD_TYPE: Release
+  LLVM_MINGW_VERSION: '20260922'
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 500M
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        target: [wow64, arm64ec]
+      fail-fast: false
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ inputs.ref || github.ref }}
+        fetch-depth: '0'
+        fetch-tags: 'true'
+
+    - name: Checkout Submodules
+      run: |
+        git submodule sync --recursive
+        for m in External/fex-posixtest-bins External/fex-gvisor-tests-bins External/fex-gcc-target-tests-bins; do
+          git config submodule.$m.update none
+        done
+        git submodule update --init --depth 1
+
+    - name: Install packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build ccache cmake python3
+
+    - name: Cache llvm-mingw
+      id: llvm-mingw-cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/llvm-mingw
+        key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-ubuntu-22.04-aarch64
+
+    - name: Download llvm-mingw
+      if: steps.llvm-mingw-cache.outputs.cache-hit != 'true'
+      run: |
+        mkdir -p "$RUNNER_TEMP/llvm-mingw"
+        curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-aarch64.tar.xz" \
+          | tar -xJ --strip-components=1 -C "$RUNNER_TEMP/llvm-mingw"
+
+    - name: Add llvm-mingw to PATH
+      run: echo "$RUNNER_TEMP/llvm-mingw/bin" >> $GITHUB_PATH
+
+    - name: Cache ccache
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ccache-fex-${{ matrix.target }}-${{ github.sha }}
+        restore-keys: ccache-fex-${{ matrix.target }}-
+
+    - name: Configure CMake
+      run: |
+        case "${{ matrix.target }}" in
+          wow64) _cc=aarch64 ;;
+          arm64ec) _cc=arm64ec ;;
+        esac
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_TOOLCHAIN_FILE=Data/CMake/toolchain_mingw.cmake \
+          -DMINGW_TRIPLE=${_cc}-w64-mingw32 -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows -G Ninja \
+          -DENABLE_LTO=False -DENABLE_ASSERTIONS=False -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+          -DBUILD_TESTING=False -DCMAKE_INSTALL_PREFIX=/usr -DTUNE_ARCH=generic -DTUNE_CPU=none -DRANGES_NATIVE=OFF
+
+    - name: Build
+      run: cmake --build build
+
+    - name: Install
+      run: DESTDIR="$PWD"/install cmake --build build -t install
+
+    - name: ccache stats
+      run: ccache -s
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: dll-${{ matrix.target }}
+        path: install/usr/lib/wine/aarch64-windows/lib*.dll
+        if-no-files-found: error
+        retention-days: 7
+
+  package:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ inputs.ref || github.ref }}
+        fetch-depth: '0'
+        fetch-tags: 'true'
+
+    - name: Compute version
+      id: version
+      env:
+        VARIANT: ${{ inputs.variant_name }}
+      run: |
+        git fetch --quiet --tags --force https://github.com/FEX-Emu/FEX.git || true
+        base=$(git describe --tags --match 'FEX-*' --abbrev=0 2>/dev/null | sed 's/^FEX-//')
+        base=${base:-0000}
+        sha=$(git rev-parse --short=7 HEAD)
+        variant=$(echo "$VARIANT" | tr -c 'A-Za-z0-9._\n' '-')
+        name="$base${variant:+-$variant}-$sha"
+        echo "version_name=$name" >> $GITHUB_OUTPUT
+        echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+        echo "describe=$(git describe --tags --match 'FEX-*' 2>/dev/null || echo unknown)" >> $GITHUB_OUTPUT
+
+    - uses: actions/download-artifact@v7
+      with:
+        pattern: dll-*
+        merge-multiple: true
+        path: dlls
+
+    - name: Assemble package
+      env:
+        VERSION_NAME: ${{ steps.version.outputs.version_name }}
+        DESCRIBE: ${{ steps.version.outputs.describe }}
+        REPO: ${{ github.repository }}
+      run: |
+        mkdir -p pkg/system32
+        cp dlls/libarm64ecfex.dll dlls/libwow64fex.dll pkg/system32/
+        cat > pkg/profile.json <<JSON
+        {
+          "type": "FEXCore",
+          "versionName": "$VERSION_NAME",
+          "versionCode": 0,
+          "description": "FEXCore $DESCRIBE ($REPO)",
+          "files": [
+            {
+              "source": "system32/libarm64ecfex.dll",
+              "target": "\${system32}/libarm64ecfex.dll"
+            },
+            {
+              "source": "system32/libwow64fex.dll",
+              "target": "\${system32}/libwow64fex.dll"
+            }
+          ]
+        }
+        JSON
+        python3 -m json.tool pkg/profile.json
+        tar -cJf "FEXCore-$VERSION_NAME.wcp" -C pkg .
+        tar -tvJf "FEXCore-$VERSION_NAME.wcp"
+        file pkg/system32/*.dll || true
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: FEXCore-${{ steps.version.outputs.version_name }}
+        path: FEXCore-${{ steps.version.outputs.version_name }}.wcp
+        if-no-files-found: error
+        compression-level: 0
+
+    - name: Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release create "$GITHUB_REF_NAME" "FEXCore-${{ steps.version.outputs.version_name }}.wcp" \
+          --repo "$GITHUB_REPOSITORY" --title "FEXCore ${{ steps.version.outputs.version_name }}" \
+          --notes "Built from ${{ steps.version.outputs.sha }}" \
+          || gh release upload "$GITHUB_REF_NAME" "FEXCore-${{ steps.version.outputs.version_name }}.wcp" --repo "$GITHUB_REPOSITORY" --clobber
