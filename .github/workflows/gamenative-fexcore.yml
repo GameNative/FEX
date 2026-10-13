@@ -1,0 +1,232 @@
+name: GameNative FEXCore
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'FEX-Emu/FEX tag, branch or SHA to build (default: newest FEX-* release tag)'
+        required: false
+        default: ''
+      variant_name:
+        description: 'Optional label added to versionName'
+        required: false
+        default: ''
+  pull_request:
+    branches: [gamenative]
+  push:
+    branches: [gamenative]
+    tags: ['gn-*']
+
+env:
+  BUILD_TYPE: Release
+  LLVM_MINGW_VERSION: '20260922'
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 500M
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      upstream_ref: ${{ steps.pick.outputs.upstream_ref }}
+      upstream_sha: ${{ steps.pick.outputs.upstream_sha }}
+      base: ${{ steps.pick.outputs.base }}
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        path: gn
+
+    - name: Pick upstream ref
+      id: pick
+      env:
+        INPUT_REF: ${{ inputs.upstream_ref }}
+      run: |
+        git clone --quiet --no-checkout https://github.com/FEX-Emu/FEX.git fex
+        cd fex
+        ref="$INPUT_REF"
+        if [ -z "$ref" ]; then
+          ref=$(git tag --list 'FEX-*' --sort=-v:refname | head -n1)
+        fi
+        sha=$(git rev-parse --verify "$ref^{commit}")
+        base=$(git describe --tags --match 'FEX-*' --abbrev=0 "$sha" | sed 's/^FEX-//')
+        echo "upstream_ref=$ref" >> $GITHUB_OUTPUT
+        echo "upstream_sha=$sha" >> $GITHUB_OUTPUT
+        echo "base=$base" >> $GITHUB_OUTPUT
+        echo "Building $ref ($sha), release base $base"
+
+    - name: Apply GameNative patches
+      run: |
+        cd fex
+        git checkout --quiet "${{ steps.pick.outputs.upstream_sha }}"
+        git config user.name gamenative-ci
+        git config user.email ci@gamenative.app
+        ../gn/gamenative/apply.sh ../gn/gamenative
+        git log --oneline "${{ steps.pick.outputs.upstream_sha }}..HEAD"
+
+    - name: Pack patched source
+      run: |
+        cd fex
+        git submodule sync --recursive
+        for m in External/fex-posixtest-bins External/fex-gvisor-tests-bins External/fex-gcc-target-tests-bins; do
+          git config submodule.$m.update none
+        done
+        git submodule update --init --depth 1
+        cd ..
+        tar --exclude='fex/.git/objects/pack/*.idx' -cf source.tar fex
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: source
+        path: source.tar
+        retention-days: 1
+        compression-level: 1
+
+  build:
+    needs: source
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        target: [wow64, arm64ec]
+      fail-fast: false
+    steps:
+    - uses: actions/download-artifact@v7
+      with:
+        name: source
+
+    - name: Unpack source
+      run: tar -xf source.tar
+
+    - name: Install packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build ccache cmake python3
+
+    - name: Cache llvm-mingw
+      id: llvm-mingw-cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/llvm-mingw
+        key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-ubuntu-22.04-aarch64
+
+    - name: Download llvm-mingw
+      if: steps.llvm-mingw-cache.outputs.cache-hit != 'true'
+      run: |
+        mkdir -p "$RUNNER_TEMP/llvm-mingw"
+        curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-aarch64.tar.xz" \
+          | tar -xJ --strip-components=1 -C "$RUNNER_TEMP/llvm-mingw"
+
+    - name: Add llvm-mingw to PATH
+      run: echo "$RUNNER_TEMP/llvm-mingw/bin" >> $GITHUB_PATH
+
+    - name: Cache ccache
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: ccache-fex-${{ matrix.target }}-${{ needs.source.outputs.upstream_sha }}-${{ github.sha }}
+        restore-keys: |
+          ccache-fex-${{ matrix.target }}-${{ needs.source.outputs.upstream_sha }}-
+          ccache-fex-${{ matrix.target }}-
+
+    - name: Configure CMake
+      working-directory: fex
+      run: |
+        case "${{ matrix.target }}" in
+          wow64) _cc=aarch64 ;;
+          arm64ec) _cc=arm64ec ;;
+        esac
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCMAKE_TOOLCHAIN_FILE=Data/CMake/toolchain_mingw.cmake \
+          -DMINGW_TRIPLE=${_cc}-w64-mingw32 -DCMAKE_INSTALL_LIBDIR=/usr/lib/wine/aarch64-windows -G Ninja \
+          -DENABLE_LTO=False -DENABLE_ASSERTIONS=False -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
+          -DBUILD_TESTING=False -DCMAKE_INSTALL_PREFIX=/usr -DTUNE_ARCH=generic -DTUNE_CPU=none -DRANGES_NATIVE=OFF
+
+    - name: Build
+      working-directory: fex
+      run: cmake --build build
+
+    - name: Install
+      working-directory: fex
+      run: DESTDIR="$PWD"/install cmake --build build -t install
+
+    - name: ccache stats
+      run: ccache -s
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: dll-${{ matrix.target }}
+        path: fex/install/usr/lib/wine/aarch64-windows/lib*.dll
+        if-no-files-found: error
+        retention-days: 7
+
+  package:
+    needs: [source, build]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Compute version
+      id: version
+      env:
+        VARIANT: ${{ inputs.variant_name }}
+        BASE: ${{ needs.source.outputs.base }}
+      run: |
+        series=$(cat gamenative/SERIES_VERSION)
+        sha=$(git rev-parse --short=7 HEAD)
+        variant=$(echo "$VARIANT" | tr -c 'A-Za-z0-9._\n' '-')
+        name="$BASE-gn$series${variant:+-$variant}-$sha"
+        echo "version_name=$name" >> $GITHUB_OUTPUT
+
+    - uses: actions/download-artifact@v7
+      with:
+        pattern: dll-*
+        merge-multiple: true
+        path: dlls
+
+    - name: Assemble package
+      env:
+        VERSION_NAME: ${{ steps.version.outputs.version_name }}
+        UPSTREAM: ${{ needs.source.outputs.upstream_ref }} ${{ needs.source.outputs.upstream_sha }}
+      run: |
+        mkdir -p pkg/system32
+        cp dlls/libarm64ecfex.dll dlls/libwow64fex.dll pkg/system32/
+        patches=$(grep -c -v -e '^#' -e '^$' gamenative/series)
+        cat > pkg/profile.json <<JSON
+        {
+          "type": "FEXCore",
+          "versionName": "$VERSION_NAME",
+          "versionCode": 0,
+          "description": "FEXCore $UPSTREAM + $patches GameNative patches",
+          "files": [
+            {
+              "source": "system32/libarm64ecfex.dll",
+              "target": "\${system32}/libarm64ecfex.dll"
+            },
+            {
+              "source": "system32/libwow64fex.dll",
+              "target": "\${system32}/libwow64fex.dll"
+            }
+          ]
+        }
+        JSON
+        python3 -m json.tool pkg/profile.json
+        tar -cJf "FEXCore-$VERSION_NAME.wcp" -C pkg .
+        tar -tvJf "FEXCore-$VERSION_NAME.wcp"
+
+    - uses: actions/upload-artifact@v6
+      with:
+        name: FEXCore-${{ steps.version.outputs.version_name }}
+        path: FEXCore-${{ steps.version.outputs.version_name }}.wcp
+        if-no-files-found: error
+        compression-level: 0
+
+    - name: Release
+      if: startsWith(github.ref, 'refs/tags/gn-')
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release create "$GITHUB_REF_NAME" "FEXCore-${{ steps.version.outputs.version_name }}.wcp" \
+          --repo "$GITHUB_REPOSITORY" --title "FEXCore ${{ steps.version.outputs.version_name }}" \
+          --notes "Upstream ${{ needs.source.outputs.upstream_ref }} (${{ needs.source.outputs.upstream_sha }}) plus the GameNative patch series at ${{ github.sha }}" \
+          || gh release upload "$GITHUB_REF_NAME" "FEXCore-${{ steps.version.outputs.version_name }}.wcp" --repo "$GITHUB_REPOSITORY" --clobber

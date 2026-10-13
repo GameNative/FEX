@@ -1,0 +1,1301 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tarikbc <tarikbc@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 17:07:39 +0530
+Subject: [PATCH] Windows: anti-tamper stepping and fault delivery performance
+
+Squashed from tarikbc/ageofempires-android patches 0004, 0006, 0009, 0012, 0013, 0014, 0017
+(Age of Empires IV, Age of Empires II: DE). Reports the guest-visible protection of trapped pages,
+makes raw x64 syscall return registers match Windows, skips the call-ret reset on invalidation
+behind FEX_EXP_SKIP_CALLRET_RESET=1, compiles volatile code regions without faults or recompiles,
+uses a 512 MB code buffer, reuses translations of re-decrypted code, and delivers guest faults
+without a host trap (FEX_EXP_FASTTRAP=0 / FEX_EXP_FASTRAISE=0 turn it off).
+Rebased onto 0001: two Core.cpp hunks and the RethrowGuestException hunk were placed by hand.
+Left out: 0002 (hides the emulator), 0007 (rewrites ntdll export bytes), 0008 (debug tool),
+0010 (obsolete on Proton 11.0-2), 0016 (hooks powrprof; belongs in Wine, bug 60462).
+
+Upstream: FEX-Emu/FEX#6022 (0012/0014), #6023 (0004); 0006 reported as Wine bug 60461.
+---
+ FEXCore/Source/Interface/Context/Context.h    |  30 ++
+ FEXCore/Source/Interface/Core/CPUBackend.h    |   7 +
+ FEXCore/Source/Interface/Core/Core.cpp        | 320 ++++++++++++++++-
+ .../Interface/Core/Dispatcher/Dispatcher.cpp  |  21 ++
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp     |   4 +
+ .../Core/SharedCodeBufferManager.cpp          |   6 +-
+ .../Interface/Core/SharedCodeBufferManager.h  |   2 +
+ FEXCore/include/FEXCore/Core/Context.h        |   5 +
+ FEXCore/include/FEXCore/Core/CoreState.h      |   1 +
+ .../FEXCore/Debug/InternalThreadState.h       |   5 +
+ Source/Windows/ARM64EC/Module.S               |  26 ++
+ Source/Windows/ARM64EC/Module.cpp             | 323 +++++++++++++++++-
+ Source/Windows/Common/InvalidationTracker.cpp | 140 +++++++-
+ Source/Windows/Common/InvalidationTracker.h   |  18 +
+ 14 files changed, 900 insertions(+), 8 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 9f427da20..a8890860c 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -152,6 +152,10 @@ public:
+   uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) override;
+ 
+   uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) override;
++  void AddVolatileCodeRegion(uint64_t Base, uint64_t Size) override;
++  bool IsVolatileCode(uint64_t Address) const override;
++  uintptr_t CompileVolatileBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP);
++  uintptr_t TryReuseBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst);
+   uint32_t ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs, uint64_t PSTATE) override;
+   void SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, uint32_t EFLAGS) override;
+ 
+@@ -515,6 +519,32 @@ private:
+   bool MonoDetected = false;
+   std::atomic<uint64_t> MonoBackpatcherBlock;
+ 
++  struct VolatileCodeRegion {
++    uint64_t Base;
++    uint64_t End;
++  };
++  VolatileCodeRegion VolatileCodeRegions[4] {};
++  std::atomic<uint32_t> NumVolatileCodeRegions {0};
++  std::mutex VolatileCodeMutex;
++  struct VolatileCacheEntry {
++    const void* Buffer;
++    uint64_t Generation;
++    uint64_t Target;
++    uintptr_t Host;
++    uint8_t Len;
++    uint8_t Bytes[15];
++  };
++  fextl::vector<VolatileCacheEntry> VolatileCache;
++  std::mutex VolatileCacheMutex;
++  struct ReuseEntry {
++    uint64_t Hash;
++    uintptr_t Host;
++    const void* Buffer;
++    uint64_t Generation;
++  };
++  fextl::unordered_map<uint64_t, ReuseEntry> ReuseCache;
++  std::mutex ReuseCacheMutex;
++
+   std::mutex CodeBufferListLock;
+   fextl::vector<std::weak_ptr<CPU::CodeBuffer>> CodeBufferList;
+ };
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.h b/FEXCore/Source/Interface/Core/CPUBackend.h
+index 0183694cd..cb08a295e 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.h
++++ b/FEXCore/Source/Interface/Core/CPUBackend.h
+@@ -138,6 +138,13 @@ namespace CPU {
+     [[nodiscard]]
+     fextl::shared_ptr<CodeBuffer> CheckCodeBufferUpdate();
+ 
++    const CodeBuffer* GetCurrentCodeBufferPtr() const {
++      return CurrentCodeBuffer.get();
++    }
++    uint64_t GetCurrentCodeBufferGeneration() const {
++      return CurrentCodeBuffer ? CurrentCodeBuffer->Generation : 0;
++    }
++
+   protected:
+     // Max spill slot size in bytes. We need at most 32 bytes
+     // to be able to handle a 256-bit vector store to a slot.
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index b11fae62d..4802fdd50 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -9,6 +9,7 @@ $end_info$
+ */
+ 
+ #include <cstdint>
++#include <cstring>
+ #ifdef ZYDIS_DISASSEMBLER
+ #include <Zydis/Zydis.h>
+ #endif
+@@ -116,6 +117,69 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
+   DiskCache.Init(this);
+ }
+ 
++// Experiment: volatile code regions (see CompileVolatileBlock). Read from outside by RVA.
++extern "C" {
++struct VolatileCodeStatsT {
++  uint64_t Marker; // "VOLCODE1"
++  uint64_t Regions;
++  uint64_t RegionBase[4];
++  uint64_t RegionSize[4];
++  uint64_t Hits;
++  uint64_t Misses;
++  uint64_t Ineligible;
++  uint64_t CodeBufferAllocs;
++  uint64_t AllocTicks[32];
++  uint64_t AllocSize[32];
++} VolatileCodeStats = {0x3145444F434C4F56ULL, 0, {}, {}, 0, 0, 0, 0, {}, {}};
++}
++
++// Experiment: reuse of translations when the same guest bytes come back (see TryReuseBlock).
++extern "C" {
++struct CodeReuseStatsT {
++  uint64_t Marker; // "REUSE001"
++  uint64_t Stored;
++  uint64_t Lookups;
++  uint64_t Hits;
++  uint64_t Mismatch;
++  uint64_t OtherBuffer;
++  uint64_t Clears;
++} CodeReuseStats = {0x3130304553554552ULL, 0, 0, 0, 0, 0, 0};
++}
++
++static bool CodeReuseEnabled() {
++  static const bool Enabled = [] {
++    const char* Value = getenv("FEX_EXP_REUSE");
++    return !Value || Value[0] != '0';
++  }();
++  return Enabled;
++}
++
++static uint64_t HashDecodedBlocks(const FEXCore::Frontend::Decoder::DecodedBlockInformation* BlockInfo) {
++  uint64_t H = 0x9E3779B97F4A7C15ULL ^ BlockInfo->Blocks.size();
++  auto Mix = [&H](uint64_t V) {
++    H ^= V;
++    H *= 0xff51afd7ed558ccdULL;
++    H ^= H >> 32;
++  };
++  for (const auto& Block : BlockInfo->Blocks) {
++    Mix(Block.Entry);
++    Mix(Block.Size);
++    const auto* P = reinterpret_cast<const uint8_t*>(Block.Entry);
++    uint64_t i = 0;
++    for (; i + 8 <= Block.Size; i += 8) {
++      uint64_t V;
++      memcpy(&V, P + i, sizeof(V));
++      Mix(V);
++    }
++    uint64_t Tail = 0;
++    if (i < Block.Size) {
++      memcpy(&Tail, P + i, Block.Size - i);
++    }
++    Mix(Tail ^ (Block.Size - i) << 56);
++  }
++  return H;
++}
++
+ struct GetFrameBlockInfoResult {
+   const CPU::CPUBackend::JITCodeHeader* InlineHeader;
+   const CPU::CPUBackend::JITCodeTail* InlineTail;
+@@ -144,6 +208,9 @@ bool ContextImpl::IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* T
+ 
+ uint64_t ContextImpl::GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) {
+   auto [_, InlineTail] = GetFrameBlockInfo(Thread->CurrentFrame);
++  if (InlineTail && Thread->VolatileEntryRIP && IsVolatileCode(InlineTail->RIP)) {
++    return Thread->VolatileEntryRIP;
++  }
+   return InlineTail ? InlineTail->RIP : 0;
+ }
+ 
+@@ -164,6 +231,10 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
+       // Reconstruct RIP from JIT entries for this block.
+       uint64_t StartingHostPC = BlockBegin;
+       uint64_t StartingGuestRIP = InlineTail->RIP;
++      if (Thread->VolatileEntryRIP && IsVolatileCode(StartingGuestRIP)) {
++        // Shared volatile block: its tail names the slot it was first compiled for.
++        StartingGuestRIP = Thread->VolatileEntryRIP;
++      }
+ 
+       for (uint32_t i = 0; i < InlineTail->NumberOfRIPEntries; ++i) {
+         auto Offset = FEXCore::Utils::vl64pair::Decode(RIPEntry);
+@@ -490,6 +561,13 @@ void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>
+     std::scoped_lock lk {CodeBufferListLock};
+     CodeBufferList.emplace_back(Buffer);
+   }
++  {
++    const uint64_t N = __atomic_fetch_add(&VolatileCodeStats.CodeBufferAllocs, 1, __ATOMIC_RELAXED);
++    uint64_t T;
++    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(T));
++    VolatileCodeStats.AllocTicks[N & 31] = T;
++    VolatileCodeStats.AllocSize[N & 31] = Buffer->TotalAllocationSize();
++  }
+ }
+ 
+ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer) {
+@@ -548,6 +626,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+     Thread->FrontendDecoder->DecodeLoop(GuestCode);
+ 
+     const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
++    if (CodeReuseEnabled()) {
++      Thread->ReuseDecodeHash = HashDecodedBlocks(BlockInfo);
++    }
+     const auto& CodeBlocks = BlockInfo->Blocks;
+ 
+     Thread->OpDispatcher->BeginFunction(GuestRIP, &CodeBlocks, BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode,
+@@ -866,6 +947,212 @@ struct CompileDepthScope {
+ };
+ } // namespace
+ 
++bool ContextImpl::IsVolatileCode(uint64_t Address) const {
++  const uint32_t N = NumVolatileCodeRegions.load(std::memory_order_acquire);
++  for (uint32_t i = 0; i < N; i++) {
++    if (Address >= VolatileCodeRegions[i].Base && Address < VolatileCodeRegions[i].End) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void ContextImpl::AddVolatileCodeRegion(uint64_t Base, uint64_t Size) {
++  std::scoped_lock lk(VolatileCodeMutex);
++  if (IsVolatileCode(Base)) {
++    return;
++  }
++  const uint32_t N = NumVolatileCodeRegions.load(std::memory_order_relaxed);
++  if (N >= 4) {
++    return;
++  }
++  VolatileCodeRegions[N] = {Base, Base + Size};
++  VolatileCodeStats.RegionBase[N] = Base;
++  VolatileCodeStats.RegionSize[N] = Size;
++  VolatileCodeStats.Regions = N + 1;
++  NumVolatileCodeRegions.store(N + 1, std::memory_order_release);
++}
++
++static uint64_t VolatileKeyHash(const uint8_t* Bytes, uint8_t Len, uint64_t Target) {
++  uint64_t H = 0xcbf29ce484222325ULL ^ Target;
++  for (uint8_t i = 0; i < Len; i++) {
++    H = (H ^ Bytes[i]) * 0x100000001b3ULL;
++  }
++  return H ^ (H >> 29);
++}
++
++// A block in a volatile region. It is never added to the lookup caches, so this runs on every visit. Blocks of the
++// form [one position-independent instruction][jmp rel8/rel32 out of the region] produce the same host code wherever they
++// are (the JIT resolves the exit to an absolute target), so they are cached by content for the thread's current code
++// buffer. Anything else is compiled for this one visit.
++uintptr_t ContextImpl::CompileVolatileBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
++  Thread->VolatileEntryRIP = GuestRIP;
++
++  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 2);
++  Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(GuestRIP));
++  const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
++
++  bool Eligible = false;
++  uint8_t Len = 0;
++  uint8_t Bytes[15] {};
++  uint64_t Target = 0;
++  if (BlockInfo->Blocks.size() == 1) {
++    const auto& Block = BlockInfo->Blocks[0];
++    if (Block.Entry == GuestRIP && Block.BlockStatus == FEXCore::Frontend::Decoder::DecodedBlockStatus::SUCCESS && Block.NumInstructions == 2) {
++      const auto& I0 = Block.DecodedInstructions[0];
++      const auto& I1 = Block.DecodedInstructions[1];
++      auto PositionDependent = [](const FEXCore::X86Tables::DecodedOperand& Op) {
++        return Op.IsRIPRelative() || Op.IsRIPRelativeRelocation() || Op.IsLiteralRelocation() || Op.IsGPRIndirectRelocation() ||
++               Op.IsSIBRelocation() || Op.IsLiteralPatchable();
++      };
++      const auto* P0 = reinterpret_cast<const uint8_t*>(GuestRIP);
++      if (I0.TableInfo && I1.TableInfo && I0.PC == GuestRIP && I0.InstSize > 0 && I0.InstSize <= 15 &&
++          !(I0.TableInfo->Flags & (FEXCore::X86Tables::InstFlags::FLAGS_SETS_RIP | FEXCore::X86Tables::InstFlags::FLAGS_BLOCK_END)) &&
++          !PositionDependent(I0.Dest) && !PositionDependent(I0.Src[0]) && !PositionDependent(I0.Src[1]) &&
++          !PositionDependent(I0.Src[2]) && !(I0.OPRaw >= 0xD8 && I0.OPRaw <= 0xDF)) {
++        const auto* P1 = P0 + I0.InstSize;
++        int64_t Disp = 0;
++        bool IsJmp = false;
++        if (I1.InstSize == 5 && P1[0] == 0xE9) {
++          int32_t D;
++          memcpy(&D, P1 + 1, sizeof(D));
++          Disp = D;
++          IsJmp = true;
++        } else if (I1.InstSize == 2 && P1[0] == 0xEB) {
++          Disp = static_cast<int8_t>(P1[1]);
++          IsJmp = true;
++        }
++        if (IsJmp) {
++          Target = GuestRIP + I0.InstSize + I1.InstSize + Disp;
++          Len = I0.InstSize;
++          memcpy(Bytes, P0, Len);
++          Eligible = !IsVolatileCode(Target);
++        }
++      }
++    }
++  }
++
++  if (Eligible) {
++    const void* Buffer = Thread->CPUBackend->GetCurrentCodeBufferPtr();
++    const uint64_t Generation = Thread->CPUBackend->GetCurrentCodeBufferGeneration();
++    uintptr_t Host = 0;
++    {
++      std::scoped_lock lk(VolatileCacheMutex);
++      if (!VolatileCache.empty()) {
++        const uint64_t H = VolatileKeyHash(Bytes, Len, Target);
++        for (size_t i = 0; i < 8; i++) {
++          const auto& E = VolatileCache[(H + i) & (VolatileCache.size() - 1)];
++          if (E.Host && E.Buffer == Buffer && E.Generation == Generation && E.Target == Target && E.Len == Len &&
++              !memcmp(E.Bytes, Bytes, Len)) {
++            Host = E.Host;
++            break;
++          }
++        }
++      }
++    }
++    if (Host) {
++      __atomic_fetch_add(&VolatileCodeStats.Hits, 1, __ATOMIC_RELAXED);
++      Thread->FrontendDecoder->DelayedDisownBuffer();
++      Thread->FrontendDecoder->ValidateDisownedOrFree();
++      Thread->OpDispatcher->ValidateDisownedOrFree();
++      return Host;
++    }
++  }
++
++  // Compile for this visit only: no lookup cache entry, no executable-range tracking (so no write trap).
++  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 2);
++  FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
++  auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, 2);
++  auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
++  if (CodePtr == nullptr) {
++    return 0;
++  } else if (!DebugData) {
++    return reinterpret_cast<uintptr_t>(CodePtr);
++  }
++  if (!CodeCache.IsGeneratingCache) {
++    Thread->CPUBackend->ClearRelocations();
++  }
++  Thread->FrontendDecoder->ValidateDisownedOrFree();
++  Thread->OpDispatcher->ValidateDisownedOrFree();
++
++  if (Eligible) {
++    const void* Buffer = Thread->CPUBackend->GetCurrentCodeBufferPtr();
++    const uint64_t Generation = Thread->CPUBackend->GetCurrentCodeBufferGeneration();
++    std::scoped_lock lk(VolatileCacheMutex);
++    if (VolatileCache.empty()) {
++      VolatileCache.resize(8192);
++    }
++    const uint64_t H = VolatileKeyHash(Bytes, Len, Target);
++    size_t Slot = H & (VolatileCache.size() - 1);
++    for (size_t i = 0; i < 8; i++) {
++      const size_t Idx = (H + i) & (VolatileCache.size() - 1);
++      const auto& E = VolatileCache[Idx];
++      if (!E.Host || E.Buffer != Buffer || E.Generation != Generation ||
++          (E.Target == Target && E.Len == Len && !memcmp(E.Bytes, Bytes, Len))) {
++        Slot = Idx;
++        break;
++      }
++    }
++    auto& E = VolatileCache[Slot];
++    E.Buffer = Buffer;
++    E.Generation = Generation;
++    E.Target = Target;
++    E.Host = reinterpret_cast<uintptr_t>(CodePtr);
++    E.Len = Len;
++    memcpy(E.Bytes, Bytes, Len);
++    __atomic_fetch_add(&VolatileCodeStats.Misses, 1, __ATOMIC_RELAXED);
++  } else {
++    __atomic_fetch_add(&VolatileCodeStats.Ineligible, 1, __ATOMIC_RELAXED);
++  }
++  return reinterpret_cast<uintptr_t>(CodePtr);
++}
++
++
++// Puts back the translation of GuestRIP from the current code buffer when the guest bytes it was compiled from are back
++// (same decode, same hash). Returns 0 (decoder reset for a normal compile) otherwise.
++uintptr_t ContextImpl::TryReuseBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst) {
++  if (Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC]) {
++    return 0;
++  }
++  ReuseEntry Entry;
++  {
++    std::scoped_lock lk(ReuseCacheMutex);
++    auto It = ReuseCache.find(GuestRIP);
++    if (It == ReuseCache.end()) {
++      return 0;
++    }
++    Entry = It->second;
++  }
++  __atomic_fetch_add(&CodeReuseStats.Lookups, 1, __ATOMIC_RELAXED);
++  if (Entry.Buffer != Thread->CPUBackend->GetCurrentCodeBufferPtr() || Entry.Generation != Thread->CPUBackend->GetCurrentCodeBufferGeneration()) {
++    __atomic_fetch_add(&CodeReuseStats.OtherBuffer, 1, __ATOMIC_RELAXED);
++    return 0;
++  }
++
++  Thread->FrontendDecoder->DecodeLoop(reinterpret_cast<const uint8_t*>(GuestRIP));
++  const auto* BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
++  if (HashDecodedBlocks(BlockInfo) != Entry.Hash) {
++    __atomic_fetch_add(&CodeReuseStats.Mismatch, 1, __ATOMIC_RELAXED);
++    Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
++    return 0;
++  }
++
++  fextl::vector<uint64_t> CodePages(BlockInfo->CodePages.begin(), BlockInfo->CodePages.end());
++  for (auto CodePage : CodePages) {
++    if (Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
++      SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
++    }
++  }
++  Thread->LookupCache->AddBlockMapping(Thread, GuestRIP, CodePages, reinterpret_cast<void*>(Entry.Host));
++  __atomic_fetch_add(&CodeReuseStats.Hits, 1, __ATOMIC_RELAXED);
++
++  Thread->FrontendDecoder->DelayedDisownBuffer();
++  Thread->FrontendDecoder->ValidateDisownedOrFree();
++  Thread->OpDispatcher->ValidateDisownedOrFree();
++  return Entry.Host;
++}
++
++
+ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
+   if constexpr (BLOCK_DEBUGGING) {
+     // Block debugging logic is hand-written and needs to be handled with care.
+@@ -902,9 +1189,20 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   if (FEXCore::UncheckedLongJump::SetJump(Thread->CompileRestartJump)) {
+     Thread->FrontendDecoder->ResetExecutableRangeCache();
+   }
++  }
++
++  if (IsVolatileCode(GuestRIP)) {
++    return CompileVolatileBlock(Thread, GuestRIP);
+ 
+   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+ 
++
++  if (CodeReuseEnabled()) {
++    if (auto Host = TryReuseBlock(Thread, GuestRIP, MaxInst)) {
++      return Host;
++    }
++  }
++
+   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+   std::optional<DiskCache::CodeHitData> Hit;
+   std::optional<uint64_t> DiskCacheGuestCodeKey;
+@@ -1040,6 +1338,19 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
+   }
+ 
++  // Remember translations of code that can be rewritten, for TryReuseBlock.
++  if (CodeReuseEnabled() && NeedsAddGuestCodeRanges && !Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC] &&
++      SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP).Writable) {
++    std::scoped_lock lk(ReuseCacheMutex);
++    if (ReuseCache.size() >= 262144) {
++      ReuseCache.clear();
++      __atomic_fetch_add(&CodeReuseStats.Clears, 1, __ATOMIC_RELAXED);
++    }
++    ReuseCache[GuestRIP] = {Thread->ReuseDecodeHash, reinterpret_cast<uintptr_t>(CodePtr), Thread->CPUBackend->GetCurrentCodeBufferPtr(),
++                            Thread->CPUBackend->GetCurrentCodeBufferGeneration()};
++    __atomic_fetch_add(&CodeReuseStats.Stored, 1, __ATOMIC_RELAXED);
++  }
++
+   // Clear any relocations that might have been generated
+   if (!CodeCache.IsGeneratingCache) {
+     Thread->CPUBackend->ClearRelocations();
+@@ -1102,7 +1413,14 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
+   // Accessing FrontendDecoder is safe as the thread's code invalidation mutex must be locked here.
+   Thread->FrontendDecoder->ResetExecutableRangeCache();
+ 
+-  if (Thread->LookupCache->InvalidateCacheRange(Start, Length)) {
++  // Patch 0009 (experiment): FEX_EXP_SKIP_CALLRET_RESET=1 skips discarding the thread's call-ret stack on every
++  // invalidation. The discard is a syscall per thread that had code cached in the range, on every SMC fault; a skipped
++  // discard can leave a return prediction into the old translation of code that changed while its caller was suspended.
++  static const bool SkipCallRetReset = [] {
++    const char* Value = getenv("FEX_EXP_SKIP_CALLRET_RESET");
++    return Value && Value[0] == '1';
++  }();
++  if (Thread->LookupCache->InvalidateCacheRange(Start, Length) && !SkipCallRetReset) {
+     FEXCORE_PROFILE_SCOPED("InvalidateCallRet");
+ 
+     // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index df48ca153..aa03d362e 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -404,6 +404,13 @@ void Dispatcher::EmitDispatcher() {
+ 
+     SpillStaticRegs(TMP1);
+ 
++    // Patch 0017: a frontend may take this guest fault directly (no host trap) through a per-thread pointer.
++    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignalTrapNative));
++    ARMEmitter::ForwardLabel NoNativeSIGILL;
++    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NoNativeSIGILL);
++    br(TMP1);
++    (void)Bind(&NoNativeSIGILL);
++
+     hlt(0);
+   }
+ 
+@@ -414,6 +421,13 @@ void Dispatcher::EmitDispatcher() {
+ 
+     SpillStaticRegs(TMP1);
+ 
++    // Patch 0017: a frontend may take this guest fault directly (no host trap) through a per-thread pointer.
++    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignalTrapNative));
++    ARMEmitter::ForwardLabel NoNativeSIGTRAP;
++    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NoNativeSIGTRAP);
++    br(TMP1);
++    (void)Bind(&NoNativeSIGTRAP);
++
+     brk(0);
+   }
+ 
+@@ -424,6 +438,13 @@ void Dispatcher::EmitDispatcher() {
+ 
+     SpillStaticRegs(TMP1);
+ 
++    // Patch 0017: a frontend may take this guest fault directly (no host trap) through a per-thread pointer.
++    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignalTrapNative));
++    ARMEmitter::ForwardLabel NoNativeSIGSEGV;
++    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NoNativeSIGSEGV);
++    br(TMP1);
++    (void)Bind(&NoNativeSIGSEGV);
++
+     // hlt/udf = SIGILL
+     // brk = SIGTRAP
+     // ??? = SIGSEGV
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index ef7e33299..58b2fe461 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -584,6 +584,10 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
+       // Hold a reference to the code buffer, to avoid linking unmapped code if compilation triggers a recreation.
+       auto CodeBuffer = static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
+       HostCode = static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlock(Frame, GuestRip, 0);
++      if (static_cast<Context::ContextImpl*>(Thread->CTX)->IsVolatileCode(GuestRip)) {
++        // Volatile blocks are classified again on every visit; a patched branch would skip that.
++        return HostCode;
++      }
+       if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()) {
+         return HostCode;
+       }
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+index eee502364..1ee79c179 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+@@ -2,6 +2,8 @@
+ #include "Interface/Core/LookupCache.h"
+ #include "Interface/Core/SharedCodeBufferManager.h"
+ 
++#include <atomic>
++
+ #include <FEXCore/fextl/memory.h>
+ #include <FEXCore/Utils/AllocatorHooks.h>
+ #include <FEXCore/Utils/LogManager.h>
+@@ -14,7 +16,7 @@
+ namespace FEXCore::CPU {
+ static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
+ // We don't want to move above 128MB atm because that means we will have to encode longer jumps
+-static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
++static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 512;
+ 
+ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
+   : AllocatedSize(Size) {
+@@ -80,6 +82,8 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size)
+ #endif
+ 
+   auto Buffer = fextl::make_shared<CodeBuffer>(Size, NameJITBuffers);
++  static std::atomic<uint64_t> NextGeneration {1};
++  Buffer->Generation = NextGeneration.fetch_add(1, std::memory_order_relaxed);
+ 
+   Latest = Buffer;
+ 
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+index be7de210b..dd9ce39d2 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+@@ -22,6 +22,8 @@ struct GuestToHostMap;
+ namespace FEXCore::CPU {
+ struct CodeBuffer {
+   fextl::unique_ptr<GuestToHostMap> LookupCache;
++  // Unique per allocated buffer, so a reused address never matches an old buffer.
++  uint64_t Generation {};
+ 
+   CodeBuffer(size_t Size, bool ShouldBeNamed);
+   CodeBuffer(const CodeBuffer&) = delete;
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index 8aa448e2e..3524bcede 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -83,6 +83,11 @@ public:
+   FEX_DEFAULT_VISIBILITY virtual bool IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread) = 0;
+   FEX_DEFAULT_VISIBILITY virtual uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) = 0;
+ 
++  ///< Volatile code regions: guest memory that is rewritten and executed so often that it is not write-trapped and its
++  ///< blocks are never cached by address.
++  FEX_DEFAULT_VISIBILITY virtual void AddVolatileCodeRegion(uint64_t Base, uint64_t Size) = 0;
++  FEX_DEFAULT_VISIBILITY virtual bool IsVolatileCode(uint64_t Address) const = 0;
++
+   ///< State reconstruction helpers
+   ///< Reconstructs the guest RIP from the passed in thread context and related Host PC.
+   FEX_DEFAULT_VISIBILITY virtual uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) = 0;
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 80514bfdc..e27507efe 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -375,6 +375,7 @@ struct JITPointers {
+   uint64_t ThreadDispatchRemoveCodeEntry {};
+   uint64_t GuestSignal_SIGILL {};
+   uint64_t GuestSignal_SIGTRAP {};
++  uint64_t GuestSignalTrapNative {}; // Patch 0017: when set, the guest-signal stubs branch here instead of trapping
+   uint64_t GuestSignal_SIGSEGV {};
+   uint64_t SignalReturnHandler {};
+   uint64_t SignalReturnHandlerRT {};
+diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+index 7d6cb2018..935c7cb73 100644
+--- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
++++ b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+@@ -114,6 +114,11 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
+   // The low address of the call-ret stack allocation (not including guard pages)
+   void* CallRetStackBase {};
+ 
++  // Guest RIP of the volatile-region block this thread entered last (see ContextImpl::CompileVolatileBlock).
++  uint64_t VolatileEntryRIP {};
++  // Hash of the guest bytes of the last decoded compile unit (see ContextImpl::TryReuseBlock).
++  uint64_t ReuseDecodeHash {};
++
+   uintptr_t JITGuardPage {};
+   uint64_t JITGuardOverflowArgument {};
+   FEXCore::UncheckedLongJump::JumpBuf RestartJump;
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 0de69d19a..e5ea6efca 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -147,6 +147,32 @@ DIRECT_SYSCALL_WRAPPER("#NtRaiseExceptionNative", WineNtRaiseExceptionSyscallId)
+   // when called by FEX).
+ DIRECT_SYSCALL_WRAPPER("#NtAllocateVirtualMemoryNative", WineNtAllocateVirtualMemorySyscallId)
+ DIRECT_SYSCALL_WRAPPER("#NtProtectVirtualMemoryNative", WineNtProtectVirtualMemorySyscallId)
++DIRECT_SYSCALL_WRAPPER("#NtQueryVirtualMemoryNative", WineNtQueryVirtualMemorySyscallId)
++
++  // Installed into ntdll's __wine_syscall_dispatcher pointer. Wine's syscall stubs enter here with the syscall number
++  // in x8, the stub's caller's return address in x9 and x30 pointing at the stub's own ret. Every syscall but the two
++  // below goes straight on to Wine's dispatcher with all registers untouched. Those two branch to a C++ wrapper with
++  // x30 set to the original caller, as if the caller had called the wrapper, and the wrapper issues the real syscall
++  // through the saved dispatcher (the *Native wrappers above).
++.global SyscallDispatcherHook
++SyscallDispatcherHook:
++  adrp x16, HookQueryVirtualMemoryId
++  ldr x16, [x16, #:lo12:HookQueryVirtualMemoryId]
++  cmp x8, x16
++  b.eq 1f
++  adrp x16, HookProtectVirtualMemoryId
++  ldr x16, [x16, #:lo12:HookProtectVirtualMemoryId]
++  cmp x8, x16
++  b.eq 2f
++  adrp x16, WineSyscallDispatcher
++  ldr x16, [x16, #:lo12:WineSyscallDispatcher]
++  br x16
++1:
++  mov x30, x9
++  b "#NtQueryVirtualMemoryHooked"
++2:
++  mov x30, x9
++  b "#NtProtectVirtualMemoryHooked"
+ 
+   // A replacement for the standard ARM64EC call checker that ignores any FFS patches and always redirects to a function's
+   // native implementation. As the only library FEX calls into is NTDLL, this is done using a LUT generated at init time.
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index ab908b0fa..56379dcb3 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -91,8 +91,27 @@ uint64_t WineNtContinueSyscallId;
+ uint64_t WineNtAllocateVirtualMemorySyscallId;
+ uint64_t WineNtProtectVirtualMemorySyscallId;
+ uint64_t WineNtRaiseExceptionSyscallId;
++uint64_t WineNtQueryVirtualMemorySyscallId = ~0ULL;
++
++// The guest-visible SMC trap fix: Wine's syscall stubs load their dispatcher from the exported
++// __wine_syscall_dispatcher pointer on every call, so replacing it with SyscallDispatcherHook (Module.S) lets FEX
++// correct what NtQueryVirtualMemory and NtProtectVirtualMemory report for pages the SMC trap has re-protected.
++void** WineSyscallDispatcherPtr;
++uint64_t HookQueryVirtualMemoryId = ~0ULL;
++uint64_t HookProtectVirtualMemoryId = ~0ULL;
++// Counters that show, from outside the process, that the filter is live in it and how often it changed a result.
++// Marker is "SMCHIDE1" in memory, so the block can also be found by scanning.
++struct {
++  uint64_t Marker;
++  uint64_t QueriesFiltered;
++  uint64_t QueriesCorrected;
++  uint64_t ProtectsFiltered;
++  uint64_t ProtectsCorrected;
++} SmcHideStats = {0x3145444948434d53ULL, 0, 0, 0, 0};
++extern void* SyscallDispatcherHook;
+ 
+ NTSTATUS NtContinueNative(ARM64_NT_CONTEXT* NativeContext, BOOLEAN Alert);
++NTSTATUS NtQueryVirtualMemoryNative(HANDLE, LPCVOID, MEMORY_INFORMATION_CLASS, PVOID, SIZE_T, SIZE_T*);
+ NTSTATUS NtAllocateVirtualMemoryNative(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG, ULONG);
+ NTSTATUS NtProtectVirtualMemoryNative(HANDLE, PVOID*, SIZE_T*, ULONG, ULONG*);
+ NTSTATUS NtRaiseExceptionNative(EXCEPTION_RECORD*, ARM64_NT_CONTEXT*, BOOL);
+@@ -268,6 +287,8 @@ void ParseWineSyscallNumbers(HMODULE NtDll) {
+       WineNtProtectVirtualMemorySyscallId = CurSyscallId;
+     } else if (strcmp(it->Name, "NtRaiseException") == 0) {
+       WineNtRaiseExceptionSyscallId = CurSyscallId;
++    } else if (strcmp(it->Name, "NtQueryVirtualMemory") == 0) {
++      WineNtQueryVirtualMemorySyscallId = CurSyscallId;
+     }
+   }
+ }
+@@ -324,6 +345,7 @@ bool InitSyscalls() {
+ 
+   const auto WineSyscallDispatcherPtr = reinterpret_cast<void**>(GetProcAddress(NtDll, "__wine_syscall_dispatcher"));
+   if (WineSyscallDispatcherPtr) {
++    ::WineSyscallDispatcherPtr = WineSyscallDispatcherPtr;
+     WineSyscallDispatcher = *WineSyscallDispatcherPtr;
+     ParseWineSyscallNumbers(NtDll);
+   } else {
+@@ -571,6 +593,81 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+   return ECContext;
+ }
+ 
++struct FastRaiseStatsType {
++  uint64_t Marker; // "FASTRAIS"
++  uint64_t Fast;
++  uint64_t Slow;
++};
++FastRaiseStatsType FastRaiseStats = {0x5349415254534146ULL, 0, 0}; // "FASTRAIS"
++static bool FastRaiseEnabled = [] { const char* E = getenv("FEX_EXP_FASTRAISE"); return !(E && E[0] == '0'); }();
++
++static void FastRaiseTo(EXCEPTION_RECORD& GuestRec, ARM64_NT_CONTEXT& GuestContext, BOOL FirstChance) {
++  if (FastRaiseEnabled && FirstChance) {
++    const uintptr_t Sp = (GuestContext.Sp - 128 - sizeof(KiUserExceptionDispatcherStackLayout)) & ~uintptr_t(0xF);
++    MEMORY_BASIC_INFORMATION Info {};
++    if (Sp > 0x10000 && NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Sp), MemoryBasicInformation, &Info, sizeof(Info), nullptr) == STATUS_SUCCESS &&
++        Info.State == MEM_COMMIT && (Info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) &&
++        reinterpret_cast<uintptr_t>(Info.BaseAddress) + Info.RegionSize >= Sp + sizeof(KiUserExceptionDispatcherStackLayout)) {
++      auto* Args = reinterpret_cast<KiUserExceptionDispatcherStackLayout*>(Sp);
++      memset(Args, 0, sizeof(*Args));
++      Args->Context = GuestContext;
++      Args->Rec = GuestRec;
++      __atomic_fetch_add(&FastRaiseStats.Fast, 1, __ATOMIC_RELAXED);
++      JumpSetStack(KiUserExceptionDispatcher, Sp);
++    }
++    __atomic_fetch_add(&FastRaiseStats.Slow, 1, __ATOMIC_RELAXED);
++  }
++  NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
++}
++
++struct FastTrapStatsType {
++  uint64_t Marker; // "FASTTRP1"
++  uint64_t Taken;
++  uint64_t Fallback;
++  uint64_t Ill, Trap, Segv;
++};
++FastTrapStatsType FastTrapStats = {0x3150525454534146ULL, 0, 0, 0, 0, 0}; // "FASTTRP1"
++static bool FastTrapEnabled = [] { const char* E = getenv("FEX_EXP_FASTTRAP"); return !(E && E[0] == '0'); }();
++static void FastRaiseOrNative(EXCEPTION_RECORD& GuestRec, ARM64_NT_CONTEXT& GuestContext, BOOL FirstChance);
++
++// Patch 0017: entered from FEXCore's guest-signal stubs (SIGILL/SIGTRAP/SIGSEGV breaks of JIT code: ud2, int3, int n,
++// trap-flag steps) with the static registers spilled, on the emulator stack, instead of a hlt/brk host trap. Builds the
++// guest exception as RethrowGuestException does after that trap, without the trap, the signal handler and the first
++// KiUserExceptionDispatcher pass. FEX_EXP_FASTTRAP=0 turns it off. Never returns.
++extern "C" __attribute__((noreturn)) void FastTrapEntry() {
++  uint64_t FPCR, FPSR;
++  __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
++  __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
++  auto* Thread = GetCPUArea().ThreadState();
++  auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
++  if (Fault.Signal == FEXCore::Core::FAULT_SIGILL) {
++    __atomic_fetch_add(&FastTrapStats.Ill, 1, __ATOMIC_RELAXED);
++  } else if (Fault.Signal == FEXCore::Core::FAULT_SIGTRAP) {
++    __atomic_fetch_add(&FastTrapStats.Trap, 1, __ATOMIC_RELAXED);
++  } else {
++    __atomic_fetch_add(&FastTrapStats.Segv, 1, __ATOMIC_RELAXED);
++  }
++  ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR));
++
++  // As RethrowGuestException: x64 clears TF when an exception is delivered.
++  uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
++  EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
++  CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
++
++  EXCEPTION_RECORD HostRec {};
++  HostRec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
++  BOOL FirstChance = TRUE;
++  EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, HostRec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
++  if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
++    GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
++  } else if (GuestRec.ExceptionCode == EXCEPTION_BREAKPOINT) {
++    GuestContext.Pc -= 1;
++  }
++  __atomic_fetch_add(&FastTrapStats.Taken, 1, __ATOMIC_RELAXED);
++  FastRaiseOrNative(GuestRec, GuestContext, FirstChance);
++  __builtin_unreachable();
++}
++
+ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
+   auto* Thread = GetCPUArea().ThreadState();
+   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+@@ -598,7 +695,15 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+     GuestContext.Pc -= 1;
+   }
+ 
+-  NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
++  // Patch 0017 (fast raise): place the dispatcher frame on the guest stack below the x64 red zone and enter
++  // KiUserExceptionDispatcher directly, as HandleSyscall does, instead of the unix NtRaiseException. A debugger does
++  // not see the first-chance event; the old path stays as the fallback when the guest stack cannot take the frame.
++  // FEX_EXP_FASTRAISE=0 turns it off.
++  FastRaiseTo(GuestRec, GuestContext, FirstChance);
++}
++
++static void FastRaiseOrNative(EXCEPTION_RECORD& GuestRec, ARM64_NT_CONTEXT& GuestContext, BOOL FirstChance) {
++  FastRaiseTo(GuestRec, GuestContext, FirstChance);
+ }
+ 
+ // A NoExec stub is compiled when a block entry is not executable at compile time. If another thread makes the page
+@@ -758,6 +863,197 @@ public:
+ };
+ } // namespace Exception
+ 
++namespace {
++using NtQueryInformationProcessFn = NTSTATUS (*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
++NtQueryInformationProcessFn NtQueryInformationProcessImpl;
++
++// The guest may query its own memory through a real handle to itself rather than NtCurrentProcess().
++bool IsCurrentProcess(HANDLE Process) {
++  if (Process == NtCurrentProcess()) {
++    return true;
++  }
++  if (!NtQueryInformationProcessImpl) {
++    return false;
++  }
++  struct {
++    NTSTATUS ExitStatus;
++    void* PebBaseAddress;
++    ULONG_PTR AffinityMask;
++    LONG BasePriority;
++    ULONG_PTR UniqueProcessId;
++    ULONG_PTR InheritedFromUniqueProcessId;
++  } Info {};
++  return !NtQueryInformationProcessImpl(Process, 0 /* ProcessBasicInformation */, &Info, sizeof(Info), nullptr) &&
++         Info.UniqueProcessId == reinterpret_cast<ULONG_PTR>(reinterpret_cast<__TEB*>(NtCurrentTeb())->ClientId.UniqueProcess);
++}
++
++struct WorkingSetExEntry {
++  void* VirtualAddress;
++  ULONG_PTR Attributes; // bit 0 Valid, bits 4-14 Win32Protection
++};
++
++bool FixupBasicInformation(MEMORY_BASIC_INFORMATION* Info) {
++  if (Info->State != MEM_COMMIT) {
++    return false;
++  }
++  const SIZE_T OriginalSize = Info->RegionSize;
++  const ULONG OriginalProt = Info->Protect;
++
++  const auto Base = reinterpret_cast<uint64_t>(Info->BaseAddress);
++  const ULONG Visible = InvalidationTracker->GuestVisibleProtection(Base, Info->Protect);
++  bool AnyFixed = Visible != Info->Protect;
++  Info->Protect = Visible;
++
++  // A trapped page splits the guest's region in two. Merge following pages that look the same to the guest, so the
++  // region boundaries match what the guest would see without the trap.
++  uint64_t Next = Base + Info->RegionSize;
++  for (int i = 0; i < 256; i++) {
++    if (!AnyFixed && !InvalidationTracker->IsTrapped(Next)) {
++      break;
++    }
++    MEMORY_BASIC_INFORMATION NextInfo;
++    if (NtQueryVirtualMemoryNative(NtCurrentProcess(), reinterpret_cast<void*>(Next), MemoryBasicInformation, &NextInfo, sizeof(NextInfo), nullptr) ||
++        NextInfo.AllocationBase != Info->AllocationBase || NextInfo.State != Info->State || NextInfo.Type != Info->Type ||
++        NextInfo.AllocationProtect != Info->AllocationProtect) {
++      break;
++    }
++    const ULONG NextVisible = InvalidationTracker->GuestVisibleProtection(Next, NextInfo.Protect);
++    if (NextVisible != Visible) {
++      break;
++    }
++    AnyFixed |= NextVisible != NextInfo.Protect;
++    Info->RegionSize += NextInfo.RegionSize;
++    Next += NextInfo.RegionSize;
++  }
++  return Info->Protect != OriginalProt || Info->RegionSize != OriginalSize;
++}
++} // namespace
++
++namespace {
++// Patch 0006: an x64 `syscall` instruction is run by Wine's x64 helper invoke_arm64ec_syscall, which calls the
++// syscall like a function, so the guest gets back rcx = whatever the callee left (measured: the status value),
++// r10 = the return address and a clobbered rdx. Hardware SYSCALL/SYSRET always returns rcx = return address and
++// r11 = rflags. The replacement below (source: patches/fex/syscall_return_fix.s) returns like hardware and keeps
++// rdx, r8, r9, r10, xmm0-xmm5 and rflags. It is installed by redirecting the helper to it.
++constexpr uint8_t SyscallReturnFixCode[] = {
++  0x55, 0x48, 0x89, 0xe5, 0x9c, 0x41, 0x52, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x48, 0x83, 0xec,
++  0x60, 0xf3, 0x0f, 0x7f, 0x04, 0x24, 0xf3, 0x0f, 0x7f, 0x4c, 0x24, 0x10, 0xf3, 0x0f, 0x7f, 0x54,
++  0x24, 0x20, 0xf3, 0x0f, 0x7f, 0x5c, 0x24, 0x30, 0xf3, 0x0f, 0x7f, 0x64, 0x24, 0x40, 0xf3, 0x0f,
++  0x7f, 0x6c, 0x24, 0x50, 0x48, 0x83, 0xe4, 0xf0, 0x48, 0x81, 0xec, 0x90, 0x00, 0x00, 0x00, 0x4c,
++  0x8b, 0x5d, 0x30, 0x4c, 0x89, 0x5c, 0x24, 0x20, 0x4c, 0x8b, 0x5d, 0x38, 0x4c, 0x89, 0x5c, 0x24,
++  0x28, 0x4c, 0x8b, 0x5d, 0x40, 0x4c, 0x89, 0x5c, 0x24, 0x30, 0x4c, 0x8b, 0x5d, 0x48, 0x4c, 0x89,
++  0x5c, 0x24, 0x38, 0x4c, 0x8b, 0x5d, 0x50, 0x4c, 0x89, 0x5c, 0x24, 0x40, 0x4c, 0x8b, 0x5d, 0x58,
++  0x4c, 0x89, 0x5c, 0x24, 0x48, 0x4c, 0x8b, 0x5d, 0x60, 0x4c, 0x89, 0x5c, 0x24, 0x50, 0x4c, 0x8b,
++  0x5d, 0x68, 0x4c, 0x89, 0x5c, 0x24, 0x58, 0x4c, 0x8b, 0x5d, 0x70, 0x4c, 0x89, 0x5c, 0x24, 0x60,
++  0x4c, 0x8b, 0x5d, 0x78, 0x4c, 0x89, 0x5c, 0x24, 0x68, 0x4c, 0x8b, 0x9d, 0x80, 0x00, 0x00, 0x00,
++  0x4c, 0x89, 0x5c, 0x24, 0x70, 0x4c, 0x8b, 0x9d, 0x88, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x5c, 0x24,
++  0x78, 0x4c, 0x8b, 0x9d, 0x90, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x9c, 0x24, 0x80, 0x00, 0x00, 0x00,
++  0x4c, 0x8b, 0x9d, 0x98, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x9c, 0x24, 0x88, 0x00, 0x00, 0x00, 0x49,
++  0xbb, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x41, 0xff, 0x14, 0xc3, 0xf3, 0x0f, 0x6f,
++  0x85, 0x70, 0xff, 0xff, 0xff, 0xf3, 0x0f, 0x6f, 0x4d, 0x80, 0xf3, 0x0f, 0x6f, 0x55, 0x90, 0xf3,
++  0x0f, 0x6f, 0x5d, 0xa0, 0xf3, 0x0f, 0x6f, 0x65, 0xb0, 0xf3, 0x0f, 0x6f, 0x6d, 0xc0, 0x4c, 0x8b,
++  0x4d, 0xd0, 0x4c, 0x8b, 0x45, 0xd8, 0x48, 0x8b, 0x55, 0xe0, 0x4c, 0x8b, 0x55, 0xe8, 0x48, 0x8b,
++  0x4d, 0xf0, 0x4c, 0x8b, 0x5d, 0xf8, 0x48, 0x8d, 0x65, 0xf8, 0x9d, 0x5d, 0xff, 0xe1};
++constexpr size_t SyscallReturnFixTableOffset = 0xd1;
++uint64_t SyscallReturnFixAddress; // where the replacement lives, 0 if not installed
++
++void InstallSyscallReturnFix() {
++  // mov [rsp+8], r10; pop r10; mov [rsp+8], r10; lea r10, [rip+disp32] -- the start of invoke_arm64ec_syscall
++  static constexpr uint8_t Sig[] = {0x4c, 0x89, 0x54, 0x24, 0x08, 0x41, 0x5a, 0x4c, 0x89, 0x54, 0x24, 0x08, 0x4c, 0x8d, 0x15};
++  const auto* Nt = RtlImageNtHeader(reinterpret_cast<HMODULE>(NtDllBase));
++  const auto* Section = IMAGE_FIRST_SECTION(Nt);
++  uint8_t* Match = nullptr;
++  int Count = 0;
++  for (int i = 0; i < Nt->FileHeader.NumberOfSections; i++, Section++) {
++    if (!(Section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
++      continue;
++    }
++    auto* Begin = reinterpret_cast<uint8_t*>(NtDllBase + Section->VirtualAddress);
++    const size_t Size = Section->Misc.VirtualSize;
++    for (size_t j = 0; j + sizeof(Sig) + 4 <= Size; j++) {
++      if (Begin[j] == Sig[0] && memcmp(Begin + j, Sig, sizeof(Sig)) == 0) {
++        Match = Begin + j;
++        Count++;
++      }
++    }
++  }
++  if (Count != 1) {
++    LogMan::Msg::IFmt("Syscall return fix not installed: invoke_arm64ec_syscall signature found {} times", Count);
++    return;
++  }
++  int32_t Disp;
++  memcpy(&Disp, Match + sizeof(Sig), sizeof(Disp));
++  const uint64_t Table = reinterpret_cast<uint64_t>(Match) + 12 + 7 + Disp;
++
++  void* Code = nullptr;
++  SIZE_T CodeSize = FEXCore::Utils::FEX_PAGE_SIZE;
++  if (NtAllocateVirtualMemoryNative(NtCurrentProcess(), &Code, 0, &CodeSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) {
++    return;
++  }
++  memcpy(Code, SyscallReturnFixCode, sizeof(SyscallReturnFixCode));
++  memcpy(static_cast<uint8_t*>(Code) + SyscallReturnFixTableOffset, &Table, sizeof(Table));
++  ULONG OldProt;
++  void* ProtAddress = Code;
++  SIZE_T ProtSize = CodeSize;
++  NtProtectVirtualMemoryNative(NtCurrentProcess(), &ProtAddress, &ProtSize, PAGE_EXECUTE_READ, &OldProt);
++  InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Code), CodeSize, PAGE_EXECUTE_READ);
++
++  uint8_t Jump[14] = {0xff, 0x25, 0, 0, 0, 0}; // jmp [rip+0]; .quad Code
++  memcpy(Jump + 6, &Code, sizeof(Code));
++  ProtAddress = Match;
++  ProtSize = sizeof(Jump);
++  NtProtectVirtualMemoryNative(NtCurrentProcess(), &ProtAddress, &ProtSize, PAGE_EXECUTE_READWRITE, &OldProt);
++  memcpy(Match, Jump, sizeof(Jump));
++  NtProtectVirtualMemoryNative(NtCurrentProcess(), &ProtAddress, &ProtSize, OldProt, &OldProt);
++  InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Match), sizeof(Jump), false);
++  SyscallReturnFixAddress = reinterpret_cast<uint64_t>(Code);
++  LogMan::Msg::IFmt("Syscall return fix installed: helper {:X} -> {:X}, table {:X}", reinterpret_cast<uint64_t>(Match),
++                    SyscallReturnFixAddress, Table);
++}
++} // namespace
++
++extern "C" NTSTATUS NtQueryVirtualMemoryHooked(HANDLE Process, LPCVOID Address, MEMORY_INFORMATION_CLASS Class, PVOID Buffer,
++                                               SIZE_T Length, SIZE_T* ResultLength) {
++  const NTSTATUS Status = NtQueryVirtualMemoryNative(Process, Address, Class, Buffer, Length, ResultLength);
++  if (Status || !InvalidationTracker || !IsCurrentProcess(Process)) {
++    return Status;
++  }
++  __atomic_fetch_add(&SmcHideStats.QueriesFiltered, 1, __ATOMIC_RELAXED);
++
++  if ((Class == MemoryBasicInformation || Class == MemoryBasicInformationCapped) && Length >= sizeof(MEMORY_BASIC_INFORMATION)) {
++    if (FixupBasicInformation(static_cast<MEMORY_BASIC_INFORMATION*>(Buffer))) {
++      __atomic_fetch_add(&SmcHideStats.QueriesCorrected, 1, __ATOMIC_RELAXED);
++    }
++  } else if (Class == MemoryWorkingSetExInformation) {
++    auto* Entries = static_cast<WorkingSetExEntry*>(Buffer);
++    for (SIZE_T i = 0; i < Length / sizeof(WorkingSetExEntry); i++) {
++      if (!(Entries[i].Attributes & 1)) {
++        continue;
++      }
++      const ULONG Prot = (Entries[i].Attributes >> 4) & 0x7ff;
++      const ULONG Visible = InvalidationTracker->GuestVisibleProtection(reinterpret_cast<uint64_t>(Entries[i].VirtualAddress), Prot);
++      if (Visible != Prot) {
++        __atomic_fetch_add(&SmcHideStats.QueriesCorrected, 1, __ATOMIC_RELAXED);
++      }
++      Entries[i].Attributes = (Entries[i].Attributes & ~(ULONG_PTR(0x7ff) << 4)) | (ULONG_PTR(Visible & 0x7ff) << 4);
++    }
++  }
++  return Status;
++}
++
++extern "C" NTSTATUS NtProtectVirtualMemoryHooked(HANDLE Process, PVOID* AddressPtr, SIZE_T* SizePtr, ULONG NewProt, ULONG* OldProt) {
++  const NTSTATUS Status = NtProtectVirtualMemoryNative(Process, AddressPtr, SizePtr, NewProt, OldProt);
++  if (!Status && OldProt && InvalidationTracker && IsCurrentProcess(Process)) {
++    __atomic_fetch_add(&SmcHideStats.ProtectsFiltered, 1, __ATOMIC_RELAXED);
++    const ULONG Visible = InvalidationTracker->GuestVisibleProtection(reinterpret_cast<uint64_t>(*AddressPtr), *OldProt);
++    if (Visible != *OldProt) {
++      __atomic_fetch_add(&SmcHideStats.ProtectsCorrected, 1, __ATOMIC_RELAXED);
++      *OldProt = Visible;
++    }
++  }
++  return Status;
++}
++
+ extern "C" void SyncThreadContext(CONTEXT* Context) {
+   ProcessPendingCrossProcessEmulatorWork();
+   auto* Thread = GetCPUArea().ThreadState();
+@@ -836,6 +1132,30 @@ NTSTATUS ProcessInit() {
+                                                           PAGE_EXECUTE_READ);
+   *reinterpret_cast<uint8_t*>(X64ReturnInstr) = 0xc3;
+ 
++  InstallSyscallReturnFix();
++
++  // Install the syscall filter last, once InvalidationTracker exists. FEX's own *Native wrappers keep using the saved
++  // WineSyscallDispatcher, so they bypass it.
++  // Only install it if the syscall number FEX derived for NtQueryVirtualMemory matches the `movz x8, #id` that ntdll's
++  // own stub for it starts with; a wrong number would send unrelated syscalls through the wrappers.
++  bool QueryIdVerified = false;
++  if (const auto QueryFFS = reinterpret_cast<uintptr_t>(GetProcAddress(NtDll, "NtQueryVirtualMemory"));
++      QueryFFS > NtDllBase && QueryFFS - NtDllBase < NtDllRedirectionLUTSize && NtDllRedirectionLUT[QueryFFS - NtDllBase]) {
++    const uint32_t Insn = *reinterpret_cast<const uint32_t*>(NtDllBase + NtDllRedirectionLUT[QueryFFS - NtDllBase]);
++    QueryIdVerified = (Insn & 0xffe0001fU) == 0xd2800008U && ((Insn >> 5) & 0xffffU) == WineNtQueryVirtualMemorySyscallId;
++  }
++
++  // Keep the x64 entry point: an indirect call goes through CheckCall, which maps it to the native code.
++  NtQueryInformationProcessImpl = reinterpret_cast<NtQueryInformationProcessFn>(GetProcAddress(NtDll, "NtQueryInformationProcess"));
++
++  if (QueryIdVerified && WineSyscallDispatcherPtr && WineNtProtectVirtualMemorySyscallId) {
++    HookQueryVirtualMemoryId = WineNtQueryVirtualMemorySyscallId;
++    HookProtectVirtualMemoryId = WineNtProtectVirtualMemorySyscallId;
++    __atomic_store_n(WineSyscallDispatcherPtr, reinterpret_cast<void*>(&SyscallDispatcherHook), __ATOMIC_RELEASE);
++    LogMan::Msg::IFmt("SMC trap hidden from guest queries (query id {}, protect id {})", HookQueryVirtualMemoryId,
++                      HookProtectVirtualMemoryId);
++  }
++
+   const uintptr_t KiUserExceptionDispatcherFFS = reinterpret_cast<uintptr_t>(GetProcAddress(NtDll, "KiUserExceptionDispatcher"));
+   Exception::KiUserExceptionDispatcher = NtDllRedirectionLUT[KiUserExceptionDispatcherFFS - NtDllBase] + NtDllBase;
+ 
+@@ -1199,6 +1519,7 @@ NTSTATUS ThreadInit() {
+ 
+   FEX::Windows::CallRetStack::InitializeThread(Thread);
+   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
++  Thread->CurrentFrame->Pointers.GuestSignalTrapNative = Exception::FastTrapEnabled ? reinterpret_cast<uintptr_t>(&Exception::FastTrapEntry) : 0;
+   CPUArea.StateFrame() = Thread->CurrentFrame;
+ 
+   uint64_t EnterEC = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC;
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index b9cfb25ff..304f29e8e 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -50,6 +50,9 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
+   const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+ 
++  // The guest has just set this protection itself, so it is what the guest should see from now on.
++  ForgetTrapped(AlignedBase, AlignedSize);
++
+   const bool NeedsInvalidate = [&]() {
+     std::unique_lock Lock(IntervalsLock);
+ 
+@@ -189,6 +192,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
+   InvalidateIntervalInternal(SectionBase, SectionSize);
+ 
+   if (Free) {
++    ForgetTrapped(SectionBase, SectionSize);
+     std::unique_lock Lock(IntervalsLock);
+     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
+     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+@@ -209,6 +213,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
+   InvalidateIntervalInternal(AlignedBase, AlignedSize);
+ 
+   if (Free) {
++    ForgetTrapped(AlignedBase, AlignedSize);
+     std::unique_lock Lock(IntervalsLock);
+     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+@@ -239,7 +244,10 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+       ULONG TmpProt;
+       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
+       SIZE_T TmpSize = 1;
+-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
++      if (!NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt)) {
++        ForgetTrapped(reinterpret_cast<uint64_t>(TmpAddress), TmpSize);
++      }
++      DetectVolatileRegion(FaultAddress);
+     }
+     DetectMonoBackpatcherBlock(Thread, HostPc);
+     return true;
+@@ -247,6 +255,77 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+   return false;
+ }
+ 
++void InvalidationTracker::DetectVolatileRegion(uint64_t FaultAddress) {
++  static const bool Enabled = [] {
++    const char* Value = getenv("FEX_EXP_VOLATILE");
++    return !Value || Value[0] != '0';
++  }();
++  if (!Enabled) {
++    return;
++  }
++  const uint64_t Page = FaultAddress & FEXCore::Utils::FEX_PAGE_MASK;
++  if (CTX.IsVolatileCode(Page)) {
++    return;
++  }
++  const size_t Idx = (Page >> 12) & 1023;
++  if (VolatileFaultPage[Idx] != Page) {
++    VolatileFaultPage[Idx] = Page;
++    VolatileFaultCount[Idx] = 0;
++  }
++  if (++VolatileFaultCount[Idx] < 16) {
++    return;
++  }
++
++  MEMORY_BASIC_INFORMATION Info;
++  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Page), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ||
++      Info.Type != MEM_PRIVATE) {
++    return;
++  }
++  const uint64_t Base = reinterpret_cast<uint64_t>(Info.AllocationBase);
++  uint64_t Size = reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize - Base;
++  while (!NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Base + Size), MemoryBasicInformation, &Info, sizeof(Info), nullptr) &&
++         reinterpret_cast<uint64_t>(Info.AllocationBase) == Base) {
++    Size += Info.RegionSize;
++  }
++  if (Size > 64ULL * 1024 * 1024) {
++    return;
++  }
++
++  CTX.AddVolatileCodeRegion(Base, Size);
++  if (!CTX.IsVolatileCode(Page)) {
++    return;
++  }
++  LogMan::Msg::IFmt("Volatile code region: {:X} - {:X}", Base, Base + Size);
++
++  // Drop the code compiled there, then give the guest its write permission back on every page FEX trapped.
++  InvalidateIntervalInternalLocked(Base, Size);
++  for (uint64_t Addr = Base; Addr < Base + Size;) {
++    FEXCore::IntervalList<uint64_t>::QueryResult Query;
++    {
++      std::scoped_lock TLock(TrappedLock);
++      Query = TrappedIntervals.Query(Addr);
++    }
++    if (!Query.Size) {
++      break;
++    }
++    const uint64_t End = std::min(Base + Size, Addr + Query.Size);
++    if (Query.Enclosed) {
++      ULONG Prot;
++      {
++        std::shared_lock Lock(IntervalsLock);
++        Prot = GetUntrapProt(Addr);
++      }
++      void* TmpAddress = reinterpret_cast<void*>(Addr);
++      SIZE_T TmpSize = End - Addr;
++      ULONG TmpProt;
++      if (!NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, Prot, &TmpProt)) {
++        ForgetTrapped(Addr, End - Addr);
++      }
++    }
++    Addr = End;
++  }
++}
++
+ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t Size) {
+   return ProtectRWXIntervalsInternal(Address, Size, true);
+ }
+@@ -410,6 +489,9 @@ void InvalidationTracker::DisableSMCDetection() {
+     }
+     Address += Query.Size;
+   } while (Query.Size);
++
++  std::scoped_lock TLock(TrappedLock);
++  TrappedIntervals.Clear();
+ }
+ 
+ ULONG InvalidationTracker::GetTrapProt(uint64_t Address) const {
+@@ -461,10 +543,31 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+         }
+         HitRWXInterval = true;
+       }
+-      void* TmpAddress = reinterpret_cast<void*>(Address);
+-      SIZE_T TmpSize = static_cast<SIZE_T>(std::min(End, Address + Query.Size) - Address);
+-      ULONG TmpProt;
+-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address), &TmpProt);
++      const uint64_t RangeEnd = std::min(End, Address + Query.Size);
++      if (ForWriteLocked) {
++        void* TmpAddress = reinterpret_cast<void*>(Address);
++        SIZE_T TmpSize = static_cast<SIZE_T>(RangeEnd - Address);
++        ULONG TmpProt;
++        if (!NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, GetUntrapProt(Address), &TmpProt)) {
++          ForgetTrapped(reinterpret_cast<uint64_t>(TmpAddress), TmpSize);
++        }
++      } else {
++        // Trap page by page: the old protection NtProtectVirtualMemory reports is that of the first page only, and a
++        // page is only recorded as trapped if the guest really had it writable (it may have set it read-only since).
++        for (uint64_t Page = Address & FEXCore::Utils::FEX_PAGE_MASK; Page < RangeEnd; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
++          if (CTX.IsVolatileCode(Page)) {
++            continue;
++          }
++          void* TmpAddress = reinterpret_cast<void*>(Page);
++          SIZE_T TmpSize = FEXCore::Utils::FEX_PAGE_SIZE;
++          ULONG TmpProt = 0;
++          const ULONG TrapProt = GetTrapProt(Page);
++          if (!NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, TrapProt, &TmpProt) && (TmpProt & 0xff) != TrapProt &&
++              (TmpProt & 0xff) == GetUntrapProt(Page)) {
++            RecordTrapped(Page, FEXCore::Utils::FEX_PAGE_SIZE);
++          }
++        }
++      }
+     } else if (!Query.Size) {
+       // No more regions past `Address` in the interval list
+       break;
+@@ -476,4 +579,31 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
+   return HitRWXInterval;
+ }
+ 
++void InvalidationTracker::RecordTrapped(uint64_t Address, uint64_t Size) {
++  std::scoped_lock TLock(TrappedLock);
++  TrappedIntervals.Insert({Address, Address + Size});
++}
++
++void InvalidationTracker::ForgetTrapped(uint64_t Address, uint64_t Size) {
++  std::scoped_lock TLock(TrappedLock);
++  TrappedIntervals.Remove({Address, Address + Size});
++}
++
++bool InvalidationTracker::IsTrapped(uint64_t Address) {
++  std::unique_lock TLock(TrappedLock, std::try_to_lock);
++  return TLock.owns_lock() && TrappedIntervals.Query(Address).Enclosed;
++}
++
++ULONG InvalidationTracker::GuestVisibleProtection(uint64_t Address, ULONG Prot) {
++  if (!IsTrapped(Address)) {
++    return Prot;
++  }
++
++  std::shared_lock Lock(IntervalsLock, std::try_to_lock);
++  if (!Lock.owns_lock() || (Prot & 0xff) != GetTrapProt(Address)) {
++    return Prot;
++  }
++  return (Prot & ~0xffUL) | GetUntrapProt(Address);
++}
++
+ } // namespace FEX::Windows
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index d2a80bcaa..7b00dff49 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -41,6 +41,12 @@ public:
+ 
+   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
+ 
++  // The SMC write trap changes the protection of guest pages behind the guest's back. These two report what the
++  // guest itself set, so the trap cannot be observed through NtQueryVirtualMemory or through the old protection
++  // returned by NtProtectVirtualMemory. Neither ever blocks: if a lock is busy, the input is returned unchanged.
++  ULONG GuestVisibleProtection(uint64_t Address, ULONG Prot);
++  bool IsTrapped(uint64_t Address);
++
+ private:
+   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
+   void DisableSMCDetection();
+@@ -67,6 +73,18 @@ private:
+   bool DEPDisabled {false};                             // Protected by IntervalsLock
+   FEXCore::IntervalList<uint64_t> DEPPromotedIntervals; // Protected by IntervalsLock
+ 
++  // Pages whose write permission FEX itself removed (and has not restored), recorded only when the page really was
++  // writable before the trap. Any guest protection change, untrap or free removes the record.
++  FEXCore::IntervalList<uint64_t> TrappedIntervals; // Protected by TrappedLock
++  std::mutex TrappedLock;
++  void RecordTrapped(uint64_t Address, uint64_t Size);
++  void ForgetTrapped(uint64_t Address, uint64_t Size);
++
++  // Volatile code region detection (FEX_EXP_VOLATILE). NOTE: called with CodeInvalidationMutex held.
++  void DetectVolatileRegion(uint64_t FaultAddress);
++  uint64_t VolatileFaultPage[1024] {};
++  uint32_t VolatileFaultCount[1024] {};
++
+   bool MonoBackpatcherDetectionPending {false};
+   uint64_t MonoBase {0};
+   uint64_t MonoEnd {0};

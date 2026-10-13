@@ -1,0 +1,4 @@
+0001-windows-fixes-for-protected-launchers-that-decry.patch
+0002-arm64ec-load-ntdllredirectionlutsize-as-32-bits-.patch
+0003-windows-anti-tamper-stepping-and-fault-delivery-.patch
+0004-arm64ec-export-btcpu64notifynonimageviews-so-ntd.patch

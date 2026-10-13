@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tarikbc <tarikbc@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 17:07:39 +0530
+Subject: [PATCH] ARM64EC: load NtDllRedirectionLUTSize as 32 bits in CheckCall
+
+The variable is a uint32_t; a 64-bit ldr only links while it happens to be 8-byte aligned,
+and the globals added by the next patch move it.
+
+Upstream: merged as FEX-Emu/FEX#6021 (94ff2b0c6, 2026-10-12). Drop this patch at FEX-2611.
+---
+ Source/Windows/ARM64EC/Module.S | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 2489e653c..0de69d19a 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -158,7 +158,7 @@ DIRECT_SYSCALL_WRAPPER("#NtProtectVirtualMemoryNative", WineNtProtectVirtualMemo
+   subs x16, x11, x9
+   b.lo end
+   adrp x17, NtDllRedirectionLUTSize
+-  ldr x17, [x17, #:lo12:NtDllRedirectionLUTSize]
++  ldr w17, [x17, #:lo12:NtDllRedirectionLUTSize]
+   cmp x16, x17
+   b.hi end
+   adrp x17, NtDllRedirectionLUT

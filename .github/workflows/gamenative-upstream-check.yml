@@ -1,0 +1,31 @@
+name: GameNative series vs upstream
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [latest-release, main]
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        path: gn
+    - name: Apply the series on ${{ matrix.ref }}
+      run: |
+        git clone --quiet --filter=blob:none https://github.com/FEX-Emu/FEX.git fex
+        cd fex
+        ref="${{ matrix.ref }}"
+        if [ "$ref" = latest-release ]; then
+          ref=$(git tag --list 'FEX-*' --sort=-v:refname | head -n1)
+        fi
+        git checkout --quiet "$ref"
+        git config user.name gamenative-ci
+        git config user.email ci@gamenative.app
+        echo "Upstream $ref = $(git rev-parse --short HEAD)"
+        ../gn/gamenative/apply.sh ../gn/gamenative

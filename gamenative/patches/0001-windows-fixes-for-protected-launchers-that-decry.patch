@@ -1,0 +1,805 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmage22 <dmage22@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 17:07:39 +0530
+Subject: [PATCH] Windows: fixes for protected launchers that decrypt code on
+ demand
+
+Squashed from Dmage22/FEX-D2 branch d2r/clean (Diablo II: Resurrected, Overwatch 2).
+Tracks executable views of non-image sections, decides image views by MEM_IMAGE, asks the OS
+about unknown executable pages, raises generated faults with hlt and the right exception code,
+retries stale NoExec faults, carries PF/AF through context conversion when ntdll exports
+__wine_arm64ec_extended_eflags, copies only decoded extents into the disk cache, restarts the
+compiler at inaccessible pages instead of deadlocking on the invalidation lock, and decodes
+0x67 MOVS/STOS and FS/GS selector loads in 64-bit mode.
+
+Upstream: analysis in FEX-Emu/FEX#5328; no PR yet.
+---
+ FEXCore/Source/Interface/Core/Core.cpp        |  34 ++++
+ FEXCore/Source/Interface/Core/DiskCache.cpp   |  10 +-
+ .../Interface/Core/Dispatcher/Dispatcher.cpp  |   9 +
+ FEXCore/Source/Interface/Core/Frontend.cpp    |   5 +
+ .../Interface/Core/OpcodeDispatcher.cpp       |  72 ++++---
+ .../Source/Interface/Core/OpcodeDispatcher.h  |   2 +
+ .../FEXCore/Debug/InternalThreadState.h       |  13 ++
+ Source/Windows/ARM64EC/Module.cpp             | 177 +++++++++++++++++-
+ Source/Windows/Common/Exception.h             |  28 ++-
+ Source/Windows/Common/InvalidationTracker.cpp | 119 +++++++++++-
+ 10 files changed, 422 insertions(+), 47 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 63280a42a..b11fae62d 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -848,6 +848,24 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
+   };
+ }
+ 
++namespace {
++// Marks the window in which a guest read fault must restart the compiler instead of reaching the guest.
++// See InternalThreadState::CompileDepth.
++struct CompileDepthScope {
++  FEXCore::Core::InternalThreadState* Thread;
++  explicit CompileDepthScope(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP)
++    : Thread {Thread} {
++    Thread->CompileDepth++;
++    Thread->CompileEntryRIP = GuestRIP;
++    Thread->CompileFaultPage = 0;
++    Thread->CompileRestartCount = 0;
++  }
++  ~CompileDepthScope() {
++    Thread->CompileDepth--;
++  }
++};
++} // namespace
++
+ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
+   if constexpr (BLOCK_DEBUGGING) {
+     // Block debugging logic is hand-written and needs to be handled with care.
+@@ -875,6 +893,16 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     return HostCode;
+   }
+ 
++  CompileDepthScope DepthScope {Thread, GuestRIP};
++  // Restart point for guest read faults taken inside the compiler. The frontend's exception handler lands here
++  // (with a non-zero value) after recording the faulting page in Thread->CompileFaultPage; the executable range
++  // query then reports that page as non-executable, so the decoder ends the block in front of it and execution
++  // reaches the page through a NoExec stub, which raises the fault the guest's handler expects. Nothing below
++  // this point holds a lock while reading guest memory, so abandoning those frames is safe.
++  if (FEXCore::UncheckedLongJump::SetJump(Thread->CompileRestartJump)) {
++    Thread->FrontendDecoder->ResetExecutableRangeCache();
++  }
++
+   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+ 
+   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+@@ -1032,6 +1060,12 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
+   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
+   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
+ 
++  CompileDepthScope DepthScope {Thread, GuestRIP};
++  // See CompileBlock.
++  if (FEXCore::UncheckedLongJump::SetJump(Thread->CompileRestartJump)) {
++    Thread->FrontendDecoder->ResetExecutableRangeCache();
++  }
++
+   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1);
+   auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
+   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.cpp b/FEXCore/Source/Interface/Core/DiskCache.cpp
+index cf341913b..90aca77d5 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.cpp
++++ b/FEXCore/Source/Interface/Core/DiskCache.cpp
+@@ -1216,7 +1216,15 @@ namespace DiskCache {
+       }
+     }
+ 
+-    memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
++    // Copy only the decoded extents. With multiblock the span between StartAddr and StartAddr + Length can
++    // cover gaps the decoder never read - possibly pages that are not accessible right now (e.g. code a
++    // protector keeps PAGE_NOACCESS until it decrypts it on demand). Touching those from inside the
++    // compiler faults with compilation locks held. Gaps are never compared (lookup and validation only
++    // look at the extents), so zero them instead.
++    memset(BlobData + GuestCodeOffset, 0, GuestCode.size());
++    for (uint32_t i = 0; i < ExactGuestCodeExtents.size(); i += 2) {
++      memcpy(BlobData + GuestCodeOffset + ExactGuestCodeExtents[i], GuestCode.data() + ExactGuestCodeExtents[i], ExactGuestCodeExtents[i + 1]);
++    }
+ 
+     MesaFOZ::foz_payload_key Key = {};
+     {
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 2f4babd70..df48ca153 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -434,8 +434,17 @@ void Dispatcher::EmitDispatcher() {
+       PopCalleeSavedRegisters();
+       ret();
+     } else {
++#ifdef _WIN32
++      // The guest-visible fault is built from SynchronousFaultData, not from the host exception, so any trap
++      // that reaches the exception handler will do. Use the same one as SIGILL: a host SIGSEGV first goes
++      // through Wine's virtual_handle_fault, and after Blizzard's D2R_loader.dll hooks ntdll and redirects
++      // execution into a PAGE_NOACCESS page of the decrypted game, that fault never reaches the emulator and
++      // the thread stalls. The SIGILL route goes straight to exception setup and does reach it.
++      hlt(0);
++#else
+       LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, 0);
+       ldr(ARMEmitter::XReg::x1, ARMEmitter::Reg::r1);
++#endif
+     }
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 78d5f1a2e..cdd8894fd 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -1765,6 +1765,11 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
+ 
+   TotalInstructions = 0;
+ 
++  // Re-query the executable range for every block. The frontend may clamp the answer to what the OS reports
++  // as accessible right now (a decrypt-on-demand protector flips pages between no-access and executable at
++  // runtime), and that can change between blocks without any invalidation reaching this decoder.
++  ResetExecutableRangeCache();
++
+   SectionMinAddress = 0;
+   SectionMaxAddress = ~0ULL;
+   Relocations = nullptr;
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 8dc605ca7..11505f20d 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -452,6 +452,11 @@ void OpDispatchBuilder::POPSegmentOp(OpcodeArgs, uint32_t SegmentReg) {
+   default: break; // Do nothing
+   }
+ 
++  if (Is64BitMode && (SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX || SegmentReg == FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX)) {
++    // See MOVSegOp: in 64-bit mode only the selector changes, the base stays.
++    return;
++  }
++
+   UpdatePrefixFromSegment(NewSegment, SegmentReg);
+ }
+ 
+@@ -1275,8 +1280,10 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
+         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_GS_PREFIX);
+       } else {
+-        LogMan::Msg::EFmt("We don't support modifying GS selector in 64bit mode!");
+-        DecodeFailure = true;
++        // 64-bit mode: a valid instruction that loads the selector only. The FS/GS bases live in MSRs there and the OS
++        // keeps GS pointing at the TEB, so the cached base must not be touched (the GDT walk in UpdatePrefixFromSegment
++        // would clobber it). Protectors execute this as an anti-debug probe; refusing it raised a bogus #UD every time.
++        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, gs_idx));
+       }
+       break;
+     case FEXCore::X86State::REG_RSP: // FS
+@@ -1285,8 +1292,8 @@ void OpDispatchBuilder::MOVSegOp(OpcodeArgs, bool ToSeg) {
+         _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
+         UpdatePrefixFromSegment(Src, FEXCore::X86Tables::DecodeFlags::FLAG_FS_PREFIX);
+       } else {
+-        LogMan::Msg::EFmt("We don't support modifying FS selector in 64bit mode!");
+-        DecodeFailure = true;
++        // See GS above.
++        _StoreContextGPR(OpSize::i16Bit, Src, offsetof(FEXCore::Core::CPUState, fs_idx));
+       }
+       break;
+     default: UnimplementedOp(Op); return;
+@@ -3213,14 +3220,25 @@ void OpDispatchBuilder::DECOp(OpcodeArgs) {
+   }
+ }
+ 
++void OpDispatchBuilder::StoreStringAddress(X86State::X86Reg Reg, Ref Value, IR::OpSize AddrSize) {
++  if (Is64BitMode && AddrSize == OpSize::i32Bit) {
++    // 32-bit address size in 64-bit mode: the register is written back zero-extended, as the hardware does.
++    StoreGPRRegister(Reg, _Bfe(OpSize::i64Bit, 32, 0, Value));
++  } else {
++    StoreGPRRegister(Reg, Value, AddrSize);
++  }
++}
++
+ void OpDispatchBuilder::STOSOp(OpcodeArgs) {
+-  if (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) {
+-    LogMan::Msg::EFmt("STOSOp: Can't handle address size override (OP: 0x{:04X}, Flags: 0x{:08X})", Op->OP, Op->Flags);
++  if (!Is64BitMode && (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE)) {
++    LogMan::Msg::EFmt("STOSOp: Address size override (0x67) not supported in 32-bit mode (OP: 0x{:04X}).", Op->OP);
+     DecodeFailure = true;
+     return;
+   }
+ 
+   const auto Size = OpSizeFromSrc(Op);
++  // In 64-bit mode an address size override makes the string registers 32-bit (EDI, ECX), handled like CMPS/SCAS/LODS.
++  const OpSize AddrSize = GetStringOpSize(Op);
+   const bool Repeat = (Op->Flags & (FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX | FEXCore::X86Tables::DecodeFlags::FLAG_REPNE_PREFIX)) != 0;
+ 
+   if (!Repeat) {
+@@ -3228,7 +3246,8 @@ void OpDispatchBuilder::STOSOp(OpcodeArgs) {
+     Ref Src = LoadGPRRegister(X86State::REG_RAX, Size, 0, true);
+ 
+     // Only ES prefix
+-    Ref Dest = MakeSegmentAddress(X86State::REG_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
++    Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
++    Ref Dest = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+ 
+     // Store to memory where RDI points
+     if (CTX->IsMemcpyAtomicTSOEnabled()) {
+@@ -3238,40 +3257,41 @@ void OpDispatchBuilder::STOSOp(OpcodeArgs) {
+     }
+ 
+     // Offset the pointer
+-    Ref TailDest = LoadGPRRegister(X86State::REG_RDI);
+-    StoreGPRRegister(X86State::REG_RDI, OffsetByDir(TailDest, IR::OpSizeToSize(Size)));
++    StoreStringAddress(X86State::REG_RDI, OffsetByDir(Src_RDI, IR::OpSizeToSize(Size)), AddrSize);
+   } else {
+     // FEX doesn't support partial faulting REP instructions.
+     // Converting this to a `MemSet` IR op optimizes this quite significantly in our codegen.
+     // If FEX is to gain support for faulting REP instructions, then this implementation needs to change significantly.
+     Ref Src = LoadGPRRegister(X86State::REG_RAX, Size);
+-    Ref Dest = LoadGPRRegister(X86State::REG_RDI);
++    Ref Dest = LoadGPRRegister(X86State::REG_RDI, AddrSize);
+ 
+     // Only ES prefix
+     auto Segment = GetSegment(0, FEXCore::X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+ 
+-    Ref Counter = LoadGPRRegister(X86State::REG_RCX);
++    Ref Counter = LoadGPRRegister(X86State::REG_RCX, AddrSize);
+ 
+     auto Result = _MemSet(CTX->IsAtomicTSOEnabled(), Size, Segment ?: InvalidNode, Dest, Src, Counter, LoadDir(1));
+     StoreGPRRegister(X86State::REG_RCX, Constant(0));
+-    StoreGPRRegister(X86State::REG_RDI, Result);
++    StoreStringAddress(X86State::REG_RDI, Result, AddrSize);
+   }
+ }
+ 
+ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
+-  if (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE) {
+-    LogMan::Msg::EFmt("MOVSOp: Can't handle address size override (OP: 0x{:04X}, Flags: 0x{:08X})", Op->OP, Op->Flags);
++  if (!Is64BitMode && (Op->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_ADDRESS_SIZE)) {
++    LogMan::Msg::EFmt("MOVSOp: Address size override (0x67) not supported in 32-bit mode (OP: 0x{:04X}).", Op->OP);
+     DecodeFailure = true;
+     return;
+   }
+ 
+   // RA now can handle these to be here, to avoid DF accesses
+   const auto Size = OpSizeFromSrc(Op);
++  // In 64-bit mode an address size override makes the string registers 32-bit (ESI, EDI, ECX), handled like CMPS/SCAS/LODS.
++  const OpSize AddrSize = GetStringOpSize(Op);
+ 
+   if (Op->Flags & (FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX | FEXCore::X86Tables::DecodeFlags::FLAG_REPNE_PREFIX)) {
+-    auto SrcAddr = LoadGPRRegister(X86State::REG_RSI);
+-    auto DstAddr = LoadGPRRegister(X86State::REG_RDI);
+-    auto Counter = LoadGPRRegister(X86State::REG_RCX);
++    auto SrcAddr = LoadGPRRegister(X86State::REG_RSI, AddrSize);
++    auto DstAddr = LoadGPRRegister(X86State::REG_RDI, AddrSize);
++    auto Counter = LoadGPRRegister(X86State::REG_RCX, AddrSize);
+ 
+     auto DstSegment = GetSegment(0, FEXCore::X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+     auto SrcSegment = GetSegment(Op->Flags, FEXCore::X86Tables::DecodeFlags::FLAG_DS_PREFIX);
+@@ -3297,11 +3317,13 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
+     }
+ 
+     StoreGPRRegister(X86State::REG_RCX, Constant(0));
+-    StoreGPRRegister(X86State::REG_RDI, Result_Dst);
+-    StoreGPRRegister(X86State::REG_RSI, Result_Src);
++    StoreStringAddress(X86State::REG_RDI, Result_Dst, AddrSize);
++    StoreStringAddress(X86State::REG_RSI, Result_Src, AddrSize);
+   } else {
+-    Ref RSI = MakeSegmentAddress(X86State::REG_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
+-    Ref RDI = MakeSegmentAddress(X86State::REG_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
++    Ref Src_RSI = LoadGPRRegister(X86State::REG_RSI, AddrSize);
++    Ref Src_RDI = LoadGPRRegister(X86State::REG_RDI, AddrSize);
++    Ref RSI = AppendSegmentOffset(Src_RSI, Op->Flags, X86Tables::DecodeFlags::FLAG_DS_PREFIX);
++    Ref RDI = AppendSegmentOffset(Src_RDI, 0, X86Tables::DecodeFlags::FLAG_ES_PREFIX, true);
+ 
+     if (CTX->IsMemcpyAtomicTSOEnabled()) {
+       auto Src = _LoadMemGPRAutoTSO(Size, RSI, Size);
+@@ -3313,11 +3335,9 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
+       _StoreMem(RegClass::GPR, Size, Src, RDI, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+     }
+ 
+-    RSI = OffsetByDir(RSI, IR::OpSizeToSize(Size));
+-    RDI = OffsetByDir(RDI, IR::OpSizeToSize(Size));
+-
+-    StoreGPRRegister(X86State::REG_RSI, RSI);
+-    StoreGPRRegister(X86State::REG_RDI, RDI);
++    // Advance the registers themselves, not the segment-adjusted addresses.
++    StoreStringAddress(X86State::REG_RSI, OffsetByDir(Src_RSI, IR::OpSizeToSize(Size)), AddrSize);
++    StoreStringAddress(X86State::REG_RDI, OffsetByDir(Src_RDI, IR::OpSizeToSize(Size)), AddrSize);
+   }
+ }
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 71766e010..85919f294 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1516,6 +1516,8 @@ private:
+ #undef OpcodeArgs
+ 
+   Ref AppendSegmentOffset(Ref Value, uint32_t Flags, uint32_t DefaultPrefix = 0, bool Override = false);
++  // Writes back a string-instruction address register (RSI/RDI) honouring the address size.
++  void StoreStringAddress(X86State::X86Reg Reg, Ref Value, IR::OpSize AddrSize);
+   Ref GetSegment(uint32_t Flags, uint32_t DefaultPrefix = FEXCore::X86Tables::DecodeFlags::FLAG_NO_PREFIX, bool Override = false);
+ 
+   void UpdatePrefixFromSegment(Ref Segment, uint32_t SegmentReg);
+diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+index 42feabb1c..7d6cb2018 100644
+--- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
++++ b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+@@ -118,6 +118,19 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
+   uint64_t JITGuardOverflowArgument {};
+   FEXCore::UncheckedLongJump::JumpBuf RestartJump;
+ 
++  // Compiler fault recovery (see ContextImpl::CompileBlock).
++  // CompileDepth is non-zero while this thread is inside CompileBlock/CompileSingleStep, i.e. while it holds
++  // CodeInvalidationMutex shared and the frontend decoder's state is live. A guest memory read that faults in
++  // that window (the decoder or the disk cache lookup touching a page a protector keeps inaccessible) must not
++  // be dispatched to the guest: the guest handler would re-enter the compiler on this thread and either deadlock
++  // on the non-recursive mutex or trample the live decoder state. The frontend instead records the faulting
++  // page and resumes at CompileRestartJump, which recompiles with that page treated as non-executable.
++  uint32_t CompileDepth {};
++  uint32_t CompileRestartCount {};
++  uint64_t CompileEntryRIP {};
++  uint64_t CompileFaultPage {};
++  FEXCore::UncheckedLongJump::JumpBuf CompileRestartJump;
++
+   // BaseFrameState should always be at the end, directly before the interrupt fault page
+   FEXCore::Core::CpuStateFrame BaseFrameState {};
+ 
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 633f252c3..ab908b0fa 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -50,6 +50,7 @@ $end_info$
+ #include "BTInterface.h"
+ #include "Windows/Common/SHMStats.h"
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <cstdio>
+ #include <type_traits>
+@@ -147,6 +148,7 @@ fextl::unique_ptr<FEX::DummyHandlers::DummySignalDelegator> SignalDelegator;
+ fextl::unique_ptr<Exception::ECSyscallHandler> SyscallHandler;
+ fextl::unique_ptr<FEX::Windows::StatAlloc> StatAllocHandler;
+ std::optional<FEX::Windows::InvalidationTracker> InvalidationTracker;
++bool NtDllExtendedEFlags {};
+ std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
+ std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
+ std::optional<FEX::Windows::ImageTracker> ImageTracker;
+@@ -347,11 +349,34 @@ bool InitSyscalls() {
+   return true;
+ }
+ 
+-void HandleImageMap(uint64_t Address, bool MainImage = false) {
++bool HandleImageMap(uint64_t Address, bool MainImage = false) {
++  // Only a SEC_IMAGE view is an image. A pagefile-backed section can still carry a valid PE header:
++  // protectors that remap their own image copy it into such a section, unmap the original and map
++  // the copy back at the same base (Blizzard's *_loader.dll does this). Parsing that as an image
++  // walks the load config in .rdata before the protector has restored its page protections, and
++  // faults inside FEX. Decide by the view type, which a copied header cannot fake.
++  MEMORY_BASIC_INFORMATION Info;
++  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ||
++      Info.Type != MEM_IMAGE) {
++    return false;
++  }
++
++  auto* Nt = RtlImageNtHeader(reinterpret_cast<HMODULE>(Address));
++  if (!Nt || Nt->Signature != IMAGE_NT_SIGNATURE) {
++    return false;
++  }
++
+   fextl::string ModulePath = FEX::Windows::GetSectionFilePath(Address);
+   fextl::string ModuleName = fextl::string {FEX::Windows::BaseName(ModulePath)};
+   InvalidationTracker->HandleImageMap(ModuleName, Address);
+   ImageTracker->HandleImageMap(ModulePath, Address, MainImage);
++  return true;
++}
++
++// A mapped view that is not a PE image still needs its executability tracked. Sanity-check the
++// notification before trusting it.
++bool IsLikelyMapViewNotification(uint64_t Address, uint64_t Size, ULONG Prot) {
++  return Address && Size && !(Address + Size < Address) && Prot;
+ }
+ 
+ void HandleImageUnmap(uint64_t Address, uint64_t Size) {
+@@ -526,8 +551,10 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+   ECContext.X24 = 0;
+   ECContext.X28 = 0;
+ 
+-  // NZCV+SS will be converted into EFlags by ntdll, the rest are lost during exception handling.
+-  // See HandleGuestException
++  // NZCV+SS will be converted into EFlags by ntdll. PF and AF have no AArch64 equivalent and ride in the RES0 cpsr
++  // bits 26/27, which a patched ntdll maps back (Dmage22/proton-wine ow/eflags-pf-af); stock ntdll ignores them.
++  // Without this, an exception or syscall round trip clears PF - Overwatch_loader.dll resumes a decrypt-on-demand
++  // fault on a jp and takes the wrong path. See HandleGuestException
+   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+   ECContext.Cpsr = 0;
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)) ? (1U << 21) : 0;
+@@ -535,6 +562,8 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC)) ? (1U << 29) : 0;
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC)) ? (1U << 30) : 0;
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC)) ? (1U << 31) : 0;
++  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC)) ? (1U << 26) : 0;
++  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC)) ? (1U << 27) : 0;
+ 
+   ECContext.Fpcr = FPCR;
+   ECContext.Fpsr = FPSR;
+@@ -572,6 +601,94 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+   NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
+ }
+ 
++// A NoExec stub is compiled when a block entry is not executable at compile time. If another thread makes the page
++// executable while that stub is being compiled, the invalidation from the protection change can land before the stub
++// is published, leaving it cached for good: every later run raises an execute fault for a page that is executable.
++// Decrypt-on-demand protectors (Overwatch_loader.dll) then spin forever, since their handler has nothing left to
++// unlock. Real hardware would just run the code, so when the fault is stale drop the cached code and resume at RIP.
++static bool RetryStaleNoExecFault(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT& Context) {
++  auto* Thread = CPUArea.ThreadState();
++  auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
++  if (!Fault.FaultToTopAndGeneratedException || Fault.Signal != FEXCore::Core::FAULT_SIGSEGV ||
++      Fault.TrapNo != FEXCore::X86State::X86_TRAPNO_PF || !InvalidationTracker) {
++    return false;
++  }
++
++  if (!IsDispatcherAddress(Context.Pc)) {
++    ReconstructThreadState(Thread, Context);
++  }
++  const uint64_t Rip = Thread->CurrentFrame->State.rip;
++
++  // Bound the retries so a disagreement between the tracker and the compiler can never become a hang.
++  static thread_local uint64_t LastRip {};
++  static thread_local uint32_t Retries {};
++  Retries = (Rip == LastRip) ? Retries + 1 : 0;
++  LastRip = Rip;
++  if (Retries >= 16) {
++    Retries = 0;
++    return false;
++  }
++
++  // Use the same query the frontend decodes against, so a retry cannot compile another NoExec stub unless the
++  // range really is non-executable again. An x86 instruction is at most 15 bytes.
++  const uint64_t End = Rip + 15;
++  uint64_t Address = Rip;
++  while (Address < End) {
++    const auto Range = InvalidationTracker->QueryExecutableRange(Address);
++    if (!Range.Size) {
++      return false;
++    }
++    Address = Range.Base + Range.Size;
++  }
++
++  const uint64_t FirstPage = Rip & FEXCore::Utils::FEX_PAGE_MASK;
++  const uint64_t LastPage = (End - 1) & FEXCore::Utils::FEX_PAGE_MASK;
++  InvalidationTracker->InvalidateAlignedInterval(FirstPage, LastPage - FirstPage + FEXCore::Utils::FEX_PAGE_SIZE, false);
++
++  Fault.FaultToTopAndGeneratedException = false;
++  Context.Pc = CPUArea.DispatcherLoopTopEnterECFillSRA();
++  Context.Sp = CPUArea.EmulatorStackBase();
++  Context.X11 = 0;                                        // ENTRY_FILL_SRA_SINGLE_INST_REG: normal block
++  Context.X17 = reinterpret_cast<uint64_t>(CPUArea.Area); // EC_ENTRY_CPUAREA_REG
++  return true;
++}
++
++// A guest memory read inside the compiler faulted: the decoder or the disk cache lookup touched a page that is
++// inaccessible right now (a decrypt-on-demand protector keeps undecrypted pages at PAGE_NOACCESS), on a thread
++// that holds CodeInvalidationMutex shared. Letting that exception reach the guest is fatal either way: the
++// protector's handler re-enters the JIT on this thread, which blocks on the non-recursive mutex as soon as any
++// other thread has a write-fault invalidation queued (every SMC trap under mtrack), and its compile would
++// trample the decoder state of the compile it interrupted. Real hardware never pre-reads code, so the right
++// outcome is for the block to end in front of that page. Record the page, which the executable range query
++// below then reports as non-executable, and resume at the compiler's restart point.
++static bool RestartCompileOnFault(FEXCore::Core::InternalThreadState* Thread, uint64_t FaultAddress, uint64_t AccessType,
++                                  ARM64_NT_CONTEXT& Context) {
++  static constexpr uint32_t MaxRestarts = 64;
++  static std::atomic<uint64_t> FaultCount {};
++
++  // The compiler only ever reads guest memory. A write or an execute fault here is something else.
++  if (AccessType != 0) {
++    return false;
++  }
++
++  const auto Count = FaultCount.fetch_add(1);
++  if (Thread->CompileRestartCount >= MaxRestarts) {
++    LogMan::Msg::EFmt("[compilefault] giving up after {} restarts: fault={:X} block={:X} pc={:X}", Thread->CompileRestartCount,
++                      FaultAddress, Thread->CompileEntryRIP, Context.Pc);
++    return false;
++  }
++
++  Thread->CompileRestartCount++;
++  Thread->CompileFaultPage = FaultAddress & FEXCore::Utils::FEX_PAGE_MASK;
++  if (Count < 32 || (Count & 255) == 0) {
++    LogMan::Msg::IFmt("[compilefault] fault={:X} block={:X} pc={:X} depth={} restart={} (#{})", FaultAddress, Thread->CompileEntryRIP,
++                      Context.Pc, Thread->CompileDepth, Thread->CompileRestartCount, Count);
++  }
++
++  FEXCore::UncheckedLongJump::ManuallyLoadJumpBuf(Thread->CompileRestartJump, 1, Context.X, reinterpret_cast<__uint128_t*>(Context.V), &Context.Pc);
++  return true;
++}
++
+ class ECSyscallHandler : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
+ public:
+   ECSyscallHandler() = default;
+@@ -615,7 +732,24 @@ public:
+   }
+ 
+   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
+-    return InvalidationTracker->QueryExecutableRange(Address);
++    auto Range = InvalidationTracker->QueryExecutableRange(Address);
++
++    // A compile restarted by RestartCompileOnFault must not read the page that faulted again, whatever the
++    // tracker or the OS say about it now: the fault is the ground truth for this compile.
++    const auto FaultPage = Thread->CompileFaultPage;
++    if (Range.Size && FaultPage) {
++      const auto FaultPageEnd = FaultPage + FEXCore::Utils::FEX_PAGE_SIZE;
++      const auto End = Range.Base + Range.Size;
++      if (Address >= FaultPage && Address < FaultPageEnd) {
++        return {};
++      } else if (Address < FaultPage && End > FaultPage) {
++        Range.Size = FaultPage - Range.Base;
++      } else if (Address >= FaultPageEnd && Range.Base < FaultPageEnd) {
++        Range.Size = End - FaultPageEnd;
++        Range.Base = FaultPageEnd;
++      }
++    }
++    return Range;
+   }
+ 
+   void PreCompile() override {
+@@ -629,9 +763,13 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
+   auto* Thread = GetCPUArea().ThreadState();
+   // All other EFlags bits are lost when converting to/from an ARM64EC context, so merge them in from the current JIT state.
+   // This is advisable over dropping their values as thread suspend/resume uses this function, and that can happen at any point in guest code.
+-  static constexpr uint32_t ECValidEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
+-                                               (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
+-                                               (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
++  // An ntdll exporting __wine_arm64ec_extended_eflags also carries PF and AF through the conversion.
++  static constexpr uint32_t ECBaseEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
++                                              (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
++                                              (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
++  static constexpr uint32_t ECExtendedEFlagsMask {ECBaseEFlagsMask | (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC) |
++                                                  (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC)};
++  const uint32_t ECValidEFlagsMask = NtDllExtendedEFlags ? ECExtendedEFlagsMask : ECBaseEFlagsMask;
+ 
+   uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+   Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
+@@ -662,6 +800,7 @@ NTSTATUS ProcessInit() {
+ 
+   const auto NtDll = GetModuleHandleW(L"ntdll.dll");
+   const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
++  NtDllExtendedEFlags = !!GetProcAddress(NtDll, "__wine_arm64ec_extended_eflags");
+   OvercommitTracker.emplace(IsWine);
+ 
+   FEX::Windows::SetupEnvironmentVariableValues(NtDll);
+@@ -761,6 +900,13 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+       return true;
+     }
+ 
++    // Must come before ThreadCreationMutex is taken: a thread that holds that mutex while it waits for the code
++    // invalidation lock (HandleRWXAccessViolation below) would otherwise deadlock against this compiling thread.
++    if (Thread->CompileDepth && !CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc) && !IsDispatcherAddress(NativeContext->Pc) &&
++        Exception::RestartCompileOnFault(Thread, FaultAddress, Exception->ExceptionInformation[0], *NativeContext)) {
++      return true;
++    }
++
+     std::scoped_lock Lock(ThreadCreationMutex);
+     if (InvalidationTracker && InvalidationTracker->HandleRWXAccessViolation(Thread, NativeContext->Pc, FaultAddress)) {
+       FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
+@@ -804,6 +950,10 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+     return true;
+   }
+ 
++  if (Exception::RetryStaleNoExecFault(CPUArea, *NativeContext)) {
++    return true;
++  }
++
+   if (IsEmulatorStackAddress(CPUArea, reinterpret_cast<uint64_t>(__builtin_frame_address(0)))) {
+     Exception::RethrowGuestException(*Exception, *NativeContext);
+     LogMan::Msg::DFmt("Rethrowing onto guest stack: {:X}", NativeContext->Sp);
+@@ -902,7 +1052,18 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
+ 
+   {
+     std::scoped_lock Lock(ThreadCreationMutex);
+-    HandleImageMap(reinterpret_cast<uint64_t>(Address));
++    // Executable views of non-image sections reach us here but have no PE header, so HandleImageMap
++    // cannot track them, and their executability comes from the view's access rights rather than a
++    // later NtProtectVirtualMemory call - so no protection notification ever fires either. Such a
++    // range ends up untracked and executing it is rejected even though the OS considers the page
++    // executable. Protectors that dodge W^X by double-mapping one section - executable at one
++    // address, writable at another - land exactly here (Blizzard's *_loader.dll among them).
++    const uint64_t GuestAddress = reinterpret_cast<uint64_t>(Address);
++    const uint64_t GuestSize = static_cast<uint64_t>(Size);
++
++    if (!HandleImageMap(GuestAddress) && IsLikelyMapViewNotification(GuestAddress, GuestSize, Prot)) {
++      InvalidationTracker->HandleMemoryProtectionNotification(GuestAddress, GuestSize, Prot);
++    }
+   }
+ 
+ 
+diff --git a/Source/Windows/Common/Exception.h b/Source/Windows/Common/Exception.h
+index 12162233c..6b8528967 100644
+--- a/Source/Windows/Common/Exception.h
++++ b/Source/Windows/Common/Exception.h
+@@ -6,6 +6,7 @@
+ #include <winternl.h>
+ 
+ #include <FEXCore/Utils/LogManager.h>
++#include <FEXCore/Utils/TypeDefines.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+ 
+ namespace FEX::Windows {
+@@ -74,12 +75,33 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
+       }
+       break;
+     case FEXCore::X86State::X86_TRAPNO_OF: Dst.ExceptionCode = EXCEPTION_INT_OVERFLOW; return Dst;
+-    case FEXCore::X86State::X86_TRAPNO_PF:
+-      // A page-fault raised by an explicit break in JIT code is always an execute fault
++    case FEXCore::X86State::X86_TRAPNO_PF: {
++      // A page-fault raised by an explicit break in JIT code is always an execute fault.
++      //
++      // The reported address has to be the first byte that could not be fetched, which is not always
++      // the start of the instruction: an instruction sitting at the tail of an executable page and
++      // running into the next one faults on that next page. Reporting the instruction start instead
++      // makes decrypt-on-demand protectors spin forever - their handler looks at
++      // ExceptionInformation[1], sees a page it has already unlocked, decides there is nothing to do,
++      // resumes, and faults identically. An x86 instruction is at most 15 bytes, so it can only ever
++      // cross a single page boundary.
++      uint64_t FaultAddress = Rip;
++      const uint64_t RipPage = Rip & FEXCore::Utils::FEX_PAGE_MASK;
++      constexpr ULONG ExecProt = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++      MEMORY_BASIC_INFORMATION Info;
++      if (VirtualQuery(reinterpret_cast<LPCVOID>(RipPage), &Info, sizeof(Info)) && Info.State == MEM_COMMIT &&
++          (Info.Protect & ExecProt)) {
++        FaultAddress = RipPage + FEXCore::Utils::FEX_PAGE_SIZE;
++      }
++
++      // Set the code explicitly like every other case: the host trap that got us here is not necessarily an
++      // access violation (on Windows the SIGSEGV trampoline raises it with hlt).
++      Dst.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+       Dst.NumberParameters = 2;
+       Dst.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
+-      Dst.ExceptionInformation[1] = Rip;
++      Dst.ExceptionInformation[1] = FaultAddress;
+       return Dst;
++    }
+     default: LogMan::Msg::EFmt("Unknown SIGSEGV trap: {}", Fault.TrapNo); break;
+     }
+     break;
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 155403d35..b9cfb25ff 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -10,6 +10,9 @@
+ #include <windef.h>
+ #include <winternl.h>
+ 
++#include <algorithm>
++#include <atomic>
++
+ namespace FEX::Windows {
+ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
+   : CTX {CTX}
+@@ -248,19 +251,117 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
+   return ProtectRWXIntervalsInternal(Address, Size, true);
+ }
+ 
++// Clamps an interval-list answer to the OS region containing Address. The interval lists describe what was
++// mapped or protected as executable at notification time, at region granularity; they say nothing about whether
++// a page can be read right now. A decrypt-on-demand protector keeps the pages it has not yet decrypted at
++// PAGE_NOACCESS inside a region the lists consider executable (D2R's whole decrypted image is one such interval),
++// and it may flip protections through paths that never notify FEX. The decoder and the disk cache lookup read
++// guest memory under the compilation lock based on this answer, so an inaccessible page must end the range:
++// the block then stops in front of it and execution reaches the page through a NoExec stub, which raises the
++// fault the protector's handler expects, outside the compiler.
++static FEXCore::HLE::ExecutableRangeInfo ClampToAccessible(FEXCore::HLE::ExecutableRangeInfo Result, uint64_t Address,
++                                                           const MEMORY_BASIC_INFORMATION& Info) {
++  if (!Result.Size) {
++    return Result;
++  }
++
++  static std::atomic<uint64_t> ClampCount {};
++
++  const bool Accessible = Info.State == MEM_COMMIT && ProtIsReadable(Info.Protect) && !(Info.Protect & PAGE_GUARD);
++  if (!Accessible) {
++    const auto Count = ClampCount.fetch_add(1);
++    if (Count < 32 || (Count & 1023) == 0) {
++      LogMan::Msg::IFmt("[xrange] {:X} is tracked executable ({:X}-{:X}) but not readable: state={:X} prot={:X} (#{})", Address,
++                        Result.Base, Result.Base + Result.Size, Info.State, Info.Protect, Count);
++    }
++    return {};
++  }
++
++  const auto RegionBase = reinterpret_cast<uint64_t>(Info.BaseAddress) & FEXCore::Utils::FEX_PAGE_MASK;
++  const auto RegionEnd = RegionBase + ((Info.RegionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
++  const auto Base = std::max(Result.Base, RegionBase);
++  const auto End = std::min(Result.Base + Result.Size, RegionEnd);
++  if (Address < Base || Address >= End) {
++    return {};
++  }
++  return {Base, End - Base, Result.Writable};
++}
++
+ FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
+-  std::shared_lock Lock(IntervalsLock);
+-  const auto XResult = XIntervals.Query(Address);
+-  if (!XResult.Enclosed) {
++  MEMORY_BASIC_INFORMATION Info;
++  if (!VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
+     return {};
+   }
+-  const auto RWXResult = RWXIntervals.Query(Address);
+-  if (RWXResult.Enclosed) {
+-    return {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true};
+-  } else if (RWXResult.Size && RWXResult.Size < XResult.Size) {
+-    return {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false};
++
++  // Assumes IntervalsLock is held.
++  const auto BuildResult = [this](uint64_t Address) -> FEXCore::HLE::ExecutableRangeInfo {
++    const auto XResult = XIntervals.Query(Address);
++    if (!XResult.Enclosed) {
++      return {};
++    }
++    const auto RWXResult = RWXIntervals.Query(Address);
++    if (RWXResult.Enclosed) {
++      return {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true};
++    } else if (RWXResult.Size && RWXResult.Size < XResult.Size) {
++      return {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false};
++    }
++    return {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
++  };
++
++  {
++    std::shared_lock Lock(IntervalsLock);
++    const auto Result = BuildResult(Address);
++    if (Result.Size) {
++      return ClampToAccessible(Result, Address, Info);
++    }
++  }
++
++  // The interval lists are only ever populated from allocation/protection notifications and from PE image
++  // maps. An executable view of a non-image section (NtMapViewOfSection with SECTION_MAP_EXECUTE) goes
++  // through neither: it has no PE header for HandleImageMap to walk, and its executability comes from the
++  // view's access rights rather than a subsequent NtProtectVirtualMemory call. Such a region is therefore
++  // never tracked, and executing it is rejected even though the OS considers the page executable.
++  //
++  // Protectors that avoid W^X by double-mapping one section - executable at one address, writable at
++  // another - land exactly here (Blizzard's *_loader.dll among them). Rather than add a notification for
++  // every mapping path, treat a miss as "ask the OS": if it says the page is executable, trust it and
++  // start tracking the region.
++  if (Info.State != MEM_COMMIT) {
++    return {};
++  }
++
++  const bool HasExec = ProtHasExec(Info.Protect);
++  const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Info.Protect));
++  if (!EffectiveExec) {
++    return {};
+   }
+-  return {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
++
++  const auto BaseAddress = reinterpret_cast<uint64_t>(Info.BaseAddress);
++  const auto AlignedBase = BaseAddress & FEXCore::Utils::FEX_PAGE_MASK;
++  const auto AlignedSize =
++    (BaseAddress - AlignedBase + Info.RegionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
++
++  {
++    std::unique_lock Lock(IntervalsLock);
++
++    // Insert directly instead of going through HandleMemoryProtectionNotification: that would also run
++    // InvalidateIntervalInternal, which takes the code invalidation mutex while a block is being compiled.
++    // Nothing needs invalidating anyway - a range that was never in XIntervals has no compiled code, and
++    // unmapping already invalidates through InvalidateContainingSection.
++    FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
++
++    XIntervals.Insert(ProtInterval);
++    if (ProtIsWritable(Info.Protect)) {
++      LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
++      RWXIntervals.Insert(ProtInterval);
++    }
++    if (DEPDisabled && !HasExec) {
++      DEPPromotedIntervals.Insert(ProtInterval);
++    }
++  }
++
++  std::shared_lock Lock(IntervalsLock);
++  return ClampToAccessible(BuildResult(Address), Address, Info);
+ }
+ 
+ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc) {
