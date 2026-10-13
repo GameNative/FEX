@@ -441,10 +441,10 @@ index b11fae62d..4802fdd50 100644
    if (FEXCore::UncheckedLongJump::SetJump(Thread->CompileRestartJump)) {
      Thread->FrontendDecoder->ResetExecutableRangeCache();
    }
-+  }
 +
 +  if (IsVolatileCode(GuestRIP)) {
 +    return CompileVolatileBlock(Thread, GuestRIP);
++  }
  
    Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
  
