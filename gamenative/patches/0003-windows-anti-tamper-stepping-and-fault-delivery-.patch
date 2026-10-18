@@ -26,10 +26,10 @@ Upstream: FEX-Emu/FEX#6022 (0012/0014), #6023 (0004); 0006 reported as Wine bug 
  FEXCore/include/FEXCore/Core/CoreState.h      |   1 +
  .../FEXCore/Debug/InternalThreadState.h       |   5 +
  Source/Windows/ARM64EC/Module.S               |  26 ++
- Source/Windows/ARM64EC/Module.cpp             | 323 +++++++++++++++++-
+ Source/Windows/ARM64EC/Module.cpp             | 331 +++++++++++++++++-
  Source/Windows/Common/InvalidationTracker.cpp | 140 +++++++-
  Source/Windows/Common/InvalidationTracker.h   |  18 +
- 14 files changed, 900 insertions(+), 8 deletions(-)
+ 14 files changed, 908 insertions(+), 8 deletions(-)
 
 diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
 index 9f427da20..a8890860c 100644
@@ -644,7 +644,7 @@ index 7d6cb2018..935c7cb73 100644
    uint64_t JITGuardOverflowArgument {};
    FEXCore::UncheckedLongJump::JumpBuf RestartJump;
 diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
-index 0de69d19a..e5ea6efca 100644
+index ce36c1d68..bf5ee5b34 100644
 --- a/Source/Windows/ARM64EC/Module.S
 +++ b/Source/Windows/ARM64EC/Module.S
 @@ -147,6 +147,32 @@ DIRECT_SYSCALL_WRAPPER("#NtRaiseExceptionNative", WineNtRaiseExceptionSyscallId)
@@ -681,7 +681,7 @@ index 0de69d19a..e5ea6efca 100644
    // A replacement for the standard ARM64EC call checker that ignores any FFS patches and always redirects to a function's
    // native implementation. As the only library FEX calls into is NTDLL, this is done using a LUT generated at init time.
 diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
-index ab908b0fa..56379dcb3 100644
+index ab908b0fa..3e7744cce 100644
 --- a/Source/Windows/ARM64EC/Module.cpp
 +++ b/Source/Windows/ARM64EC/Module.cpp
 @@ -91,8 +91,27 @@ uint64_t WineNtContinueSyscallId;
@@ -729,7 +729,7 @@ index ab908b0fa..56379dcb3 100644
      WineSyscallDispatcher = *WineSyscallDispatcherPtr;
      ParseWineSyscallNumbers(NtDll);
    } else {
-@@ -571,6 +593,81 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+@@ -571,6 +593,89 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
    return ECContext;
  }
  
@@ -794,8 +794,16 @@ index ab908b0fa..56379dcb3 100644
 +  EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
 +  CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
 +
++  // The exception the stub's host trap would have raised (hlt: SIGILL, brk: SIGTRAP, a null load: SIGSEGV).
++  // HandleGuestException keeps this code for execute faults, so it must match the trap.
 +  EXCEPTION_RECORD HostRec {};
-+  HostRec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
++  if (Fault.Signal == FEXCore::Core::FAULT_SIGILL) {
++    HostRec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
++  } else if (Fault.Signal == FEXCore::Core::FAULT_SIGTRAP) {
++    HostRec.ExceptionCode = EXCEPTION_BREAKPOINT;
++  } else {
++    HostRec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
++  }
 +  BOOL FirstChance = TRUE;
 +  EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, HostRec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
 +  if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
@@ -811,7 +819,7 @@ index ab908b0fa..56379dcb3 100644
  static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
    auto* Thread = GetCPUArea().ThreadState();
    auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
-@@ -598,7 +695,15 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+@@ -598,7 +703,15 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
      GuestContext.Pc -= 1;
    }
  
@@ -828,7 +836,7 @@ index ab908b0fa..56379dcb3 100644
  }
  
  // A NoExec stub is compiled when a block entry is not executable at compile time. If another thread makes the page
-@@ -758,6 +863,197 @@ public:
+@@ -758,6 +871,197 @@ public:
  };
  } // namespace Exception
  
@@ -1026,7 +1034,7 @@ index ab908b0fa..56379dcb3 100644
  extern "C" void SyncThreadContext(CONTEXT* Context) {
    ProcessPendingCrossProcessEmulatorWork();
    auto* Thread = GetCPUArea().ThreadState();
-@@ -836,6 +1132,30 @@ NTSTATUS ProcessInit() {
+@@ -836,6 +1140,30 @@ NTSTATUS ProcessInit() {
                                                            PAGE_EXECUTE_READ);
    *reinterpret_cast<uint8_t*>(X64ReturnInstr) = 0xc3;
  
@@ -1057,7 +1065,7 @@ index ab908b0fa..56379dcb3 100644
    const uintptr_t KiUserExceptionDispatcherFFS = reinterpret_cast<uintptr_t>(GetProcAddress(NtDll, "KiUserExceptionDispatcher"));
    Exception::KiUserExceptionDispatcher = NtDllRedirectionLUT[KiUserExceptionDispatcherFFS - NtDllBase] + NtDllBase;
  
-@@ -1199,6 +1519,7 @@ NTSTATUS ThreadInit() {
+@@ -1199,6 +1527,7 @@ NTSTATUS ThreadInit() {
  
    FEX::Windows::CallRetStack::InitializeThread(Thread);
    Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
