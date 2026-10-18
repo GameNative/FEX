@@ -1,26 +1,33 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: tarikbc <tarikbc@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 17:07:39 +0530
-Subject: [PATCH] ARM64EC: load NtDllRedirectionLUTSize as 32 bits in CheckCall
+Subject: [PATCH] ARM64EC: fix the NtDllRedirectionLUT size load and bounds check in
+ CheckCall
 
-The variable is a uint32_t; a 64-bit ldr only links while it happens to be 8-byte aligned,
-and the globals added by the next patch move it.
+NtDllRedirectionLUTSize is a uint32_t; a 64-bit ldr only links while it happens to be
+8-byte aligned, and the globals added by the next patch move it. The bounds check used
+b.hi, which let an offset equal to the size through and read one entry past the end of
+the LUT.
 
-Upstream: merged as FEX-Emu/FEX#6021 (94ff2b0c6, 2026-10-12). Drop this patch at FEX-2611.
+Upstream: both commits of FEX-Emu/FEX#6021 (4dbb046d62, 3a2b1c0b43; merged as 94ff2b0c6,
+2026-10-12). Drop this patch at FEX-2611.
 ---
- Source/Windows/ARM64EC/Module.S | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ Source/Windows/ARM64EC/Module.S | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
-index 2489e653c..0de69d19a 100644
+index 2489e653c..ce36c1d68 100644
 --- a/Source/Windows/ARM64EC/Module.S
 +++ b/Source/Windows/ARM64EC/Module.S
-@@ -158,7 +158,7 @@ DIRECT_SYSCALL_WRAPPER("#NtProtectVirtualMemoryNative", WineNtProtectVirtualMemo
+@@ -158,9 +158,9 @@ DIRECT_SYSCALL_WRAPPER("#NtProtectVirtualMemoryNative", WineNtProtectVirtualMemo
    subs x16, x11, x9
    b.lo end
    adrp x17, NtDllRedirectionLUTSize
 -  ldr x17, [x17, #:lo12:NtDllRedirectionLUTSize]
 +  ldr w17, [x17, #:lo12:NtDllRedirectionLUTSize]
    cmp x16, x17
-   b.hi end
+-  b.hi end
++  b.hs end
    adrp x17, NtDllRedirectionLUT
+   ldr x17, [x17, #:lo12:NtDllRedirectionLUT]
+   ldr w11, [x17, x16, lsl #2]
