@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tarikbc <tarikbc@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 13:01:49 -0300
+Subject: [PATCH] ARM64EC: present exported FF 25 thunks as REX.W jumps
+
+Wine's ARM64EC DLLs export some functions as a bare x64 `jmp [rip+disp32]`
+(FF 25). x64 hook-detection code reads a bare FF 25 at a function start as
+an inline hook: Age of Empires IV's protection checks 63 Windows API
+functions this way, 27 of the kernel32 ones start with FF 25 under Wine,
+and the game is stopped about two minutes after launch.
+
+On every mapped ARM64X image (one with a .hexpthk section), and once for the
+images loaded before the first map notification, rewrite each exported
+FF 25 thunk as `48 FF 25 disp32-1`, the REX.W form of the same jump. A thunk
+is only rewritten when the byte after it is padding and the 7 bytes stay
+inside an executable section. Only SEC_IMAGE views are parsed.
+
+FEX_EXP_EXPORT_THUNKS=0 turns it off. Wine bug 60463.
+---
+ Source/Windows/ARM64EC/Module.cpp | 101 +++++++++++++++++++++++++++++-
+ 1 file changed, 98 insertions(+), 3 deletions(-)
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 8566b36a0..b9668986f 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -371,6 +371,96 @@ bool InitSyscalls() {
+   return true;
+ }
+ 
++// Wine's ARM64EC DLLs export some functions as bare x64 `jmp [rip+disp32]` thunks (FF 25). On Windows, x64 code that
++// resolves an ARM64EC export finds a fast-forward sequence (an x64 prolog, then a jump), and x86-64 Wine puts a
++// hot-patch prolog first; x64 hooking and hook-detection code expects such a start, not a bare FF 25, and reads the
++// bare jump as an inline hook. Present each such exported thunk as `48 FF 25 disp32-1`, the REX.W form of the same
++// jump, in every ARM64X image. FEX_EXP_EXPORT_THUNKS=0 turns it off.
++static bool ExportThunkFixEnabled = [] {
++  const char* E = getenv("FEX_EXP_EXPORT_THUNKS");
++  return !(E && E[0] == '0');
++}();
++static bool ExportThunksWalked = false;
++
++void RewriteExportThunks(uint64_t Address) {
++  if (!Address || reinterpret_cast<IMAGE_DOS_HEADER*>(Address)->e_magic != IMAGE_DOS_SIGNATURE) {
++    return;
++  }
++  auto* Nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(Address + reinterpret_cast<IMAGE_DOS_HEADER*>(Address)->e_lfanew);
++  if (Nt->Signature != IMAGE_NT_SIGNATURE || Nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
++    return;
++  }
++  bool HasThunks = false;
++  const auto* Section = IMAGE_FIRST_SECTION(Nt);
++  for (int i = 0; i < Nt->FileHeader.NumberOfSections; i++, Section++) {
++    if (!memcmp(Section->Name, ".hexpthk", 8)) {
++      HasThunks = true;
++    }
++  }
++  const auto& Dir = Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
++  if (!HasThunks || !Dir.VirtualAddress || !Dir.Size) {
++    return;
++  }
++  const auto* Exports = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(Address + Dir.VirtualAddress);
++  const auto* Functions = reinterpret_cast<const uint32_t*>(Address + Exports->AddressOfFunctions);
++  for (uint32_t i = 0; i < Exports->NumberOfFunctions; i++) {
++    const uint32_t Rva = Functions[i];
++    if (!Rva || (Rva >= Dir.VirtualAddress && Rva < Dir.VirtualAddress + Dir.Size) || Rva >= Nt->OptionalHeader.SizeOfImage) {
++      continue;
++    }
++    auto* Code = reinterpret_cast<uint8_t*>(Address + Rva);
++    if (Code[0] != 0xff || Code[1] != 0x25) {
++      continue;
++    }
++    // Only rewrite when the byte after the 6-byte jump is padding, so nothing that follows is overwritten.
++    if (Code[6] != 0x00 && Code[6] != 0xcc && Code[6] != 0x90) {
++      continue;
++    }
++    // The longer form must also stay inside an executable section: FEX only runs code within a section's
++    // VirtualSize, and the last thunk of a section can end exactly there (kernelbase .text does).
++    bool InSection = false;
++    Section = IMAGE_FIRST_SECTION(Nt);
++    for (int j = 0; j < Nt->FileHeader.NumberOfSections; j++, Section++) {
++      if ((Section->Characteristics & IMAGE_SCN_MEM_EXECUTE) && Rva >= Section->VirtualAddress &&
++          Rva + 7 <= Section->VirtualAddress + Section->Misc.VirtualSize) {
++        InSection = true;
++      }
++    }
++    if (!InSection) {
++      continue;
++    }
++    int32_t Disp;
++    memcpy(&Disp, Code + 2, sizeof(Disp));
++    Disp -= 1;
++    uint8_t New[7] = {0x48, 0xff, 0x25};
++    memcpy(New + 3, &Disp, sizeof(Disp));
++    void* ProtAddress = Code;
++    SIZE_T ProtSize = sizeof(New);
++    ULONG Prot;
++    if (NtProtectVirtualMemoryNative(NtCurrentProcess(), &ProtAddress, &ProtSize, PAGE_EXECUTE_READWRITE, &Prot)) {
++      continue;
++    }
++    memcpy(Code, New, sizeof(New));
++    NtProtectVirtualMemoryNative(NtCurrentProcess(), &ProtAddress, &ProtSize, Prot, &Prot);
++  }
++}
++
++// Called for each newly mapped image; the first call also covers the images that were loaded before it.
++void RewriteExportThunksForImage(uint64_t Address) {
++  if (!ExportThunkFixEnabled) {
++    return;
++  }
++  if (!ExportThunksWalked) {
++    ExportThunksWalked = true;
++    auto* Ldr = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->LdrData;
++    auto* Head = &Ldr->InMemoryOrderModuleList;
++    for (auto* Entry = Head->Flink; Entry != Head; Entry = Entry->Flink) {
++      RewriteExportThunks(reinterpret_cast<uint64_t>(CONTAINING_RECORD(Entry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks)->DllBase));
++    }
++  }
++  RewriteExportThunks(Address);
++}
++
+ bool HandleImageMap(uint64_t Address, bool MainImage = false) {
+   // Only a SEC_IMAGE view is an image. A pagefile-backed section can still carry a valid PE header:
+   // protectors that remap their own image copy it into such a section, unmap the original and map
+@@ -1382,6 +1472,8 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
+     return STATUS_SUCCESS;
+   }
+ 
++  const uint64_t GuestAddress = reinterpret_cast<uint64_t>(Address);
++  bool IsImage;
+   {
+     std::scoped_lock Lock(ThreadCreationMutex);
+     // Executable views of non-image sections reach us here but have no PE header, so HandleImageMap
+@@ -1390,14 +1482,17 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
+     // range ends up untracked and executing it is rejected even though the OS considers the page
+     // executable. Protectors that dodge W^X by double-mapping one section - executable at one
+     // address, writable at another - land exactly here (Blizzard's *_loader.dll among them).
+-    const uint64_t GuestAddress = reinterpret_cast<uint64_t>(Address);
+     const uint64_t GuestSize = static_cast<uint64_t>(Size);
+ 
+-    if (!HandleImageMap(GuestAddress) && IsLikelyMapViewNotification(GuestAddress, GuestSize, Prot)) {
++    IsImage = HandleImageMap(GuestAddress);
++    if (!IsImage && IsLikelyMapViewNotification(GuestAddress, GuestSize, Prot)) {
+       InvalidationTracker->HandleMemoryProtectionNotification(GuestAddress, GuestSize, Prot);
+     }
+   }
+-
++  // Only SEC_IMAGE views: a copied PE header in a pagefile-backed view is not safe to parse yet (see HandleImageMap).
++  if (IsImage) {
++    RewriteExportThunksForImage(GuestAddress);
++  }
+ 
+   return STATUS_SUCCESS;
+ }

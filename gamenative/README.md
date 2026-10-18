@@ -22,10 +22,11 @@ behaviour that is not a plain correctness fix is behind an env var.
 | 0002 arm64ec-load-ntdllredirectionlutsize-as-32-bits | tarikbc 0015 + upstream 3a2b1c0b43 | 32-bit load of `NtDllRedirectionLUTSize`; `b.hs` bounds check so an offset equal to the size no longer reads past the LUT | FEX-Emu/FEX#6021, fully merged (both commits). Drop at FEX-2611 |
 | 0003 windows-anti-tamper-stepping-and-fault-delivery | tarikbc 0004, 0006, 0009, 0012, 0013, 0014, 0017 (v1.6.0, f4a686a0) squashed | Guest-visible protection of trapped pages, raw syscall return registers, volatile code regions, 512 MB code buffer, translation reuse, guest faults without a host trap with the exception code picked per signal (SIGILL, SIGTRAP, SIGSEGV). Env gates: `FEX_EXP_SKIP_CALLRET_RESET=1` opts in; `FEX_EXP_FASTTRAP=0`, `FEX_EXP_FASTRAISE=0` opt out | FEX-Emu/FEX#6022, #6023; Wine bug 60461 |
 | 0004 arm64ec-export-btcpu64notifynonimageviews | GameNative | Exports `BTCpu64NotifyNonImageViews` so ntdll only reports non-image views to a FEX that can take them | pairs with GameNative/proton-wine `dlls_arm64ec_emulator_notifications.patch` |
+| 0005 arm64ec-present-exported-ff-25-thunks-as-rex-w-j | tarikbc 0007, rebased onto 0001 | Rewrites the bare `jmp [rip+disp32]` (`FF 25`) export thunks of ARM64X images as `48 FF 25`, the REX.W form of the same jump, so x64 hook checks do not read them as inline hooks (AoE IV's protection checks 63 APIs and stops the game about 2 minutes in without it). SEC_IMAGE views only. Env gate: `FEX_EXP_EXPORT_THUNKS=0` opts out | Wine bug 60463; no FEX PR |
 
-Left out of 0003 on purpose: tarikbc 0002 (hides the emulator from the guest), 0007 (rewrites
-ntdll export bytes to pass one game's hook check), 0008 (debug tool), 0010 (obsolete on Proton
-11.0-2), 0016 (hooks `powrprof` from the exit thunk; the fix belongs in Wine, bug 60462).
+Left out of 0003 on purpose: tarikbc 0002 (hides the emulator from the guest), 0008 (debug tool),
+0010 (obsolete on Proton 11.0-2), 0016 (hooks `powrprof` from the exit thunk; the fix belongs in
+Wine, bug 60462).
 Left out of 0001: dmage22's log-level change (cosmetic).
 
 Patch 0003 was rebased onto 0001 by hand in three places: the volatile-code and translation-reuse
