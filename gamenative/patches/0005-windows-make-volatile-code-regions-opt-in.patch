@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <dalal.utkarsh@gmail.com>
+Date: Tue, 20 Oct 2026 15:04:29 +0530
+Subject: [PATCH] Windows: make volatile code regions opt-in
+
+DetectVolatileRegion was on unless FEX_EXP_VOLATILE=0. On JIT runtimes it
+misfires: TMNT: Shredder's Revenge (FNA/.NET) spends most of its main thread
+recompiling, runs about 10x slower and never creates a D3D device. Enable it
+only for FEX_EXP_VOLATILE=1; titles that need it (Age of Empires IV) set it.
+---
+ Source/Windows/Common/InvalidationTracker.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 304f29e8e..26e56352e 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -258,7 +258,7 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+ void InvalidationTracker::DetectVolatileRegion(uint64_t FaultAddress) {
+   static const bool Enabled = [] {
+     const char* Value = getenv("FEX_EXP_VOLATILE");
+-    return !Value || Value[0] != '0';
++    return Value && Value[0] == '1';
+   }();
+   if (!Enabled) {
+     return;
