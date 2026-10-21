@@ -175,8 +175,15 @@ jobs:
         series=$(cat gamenative/SERIES_VERSION)
         sha=$(git rev-parse --short=7 HEAD)
         variant=$(echo "$VARIANT" | tr -c 'A-Za-z0-9._\n' '-')
-        name="$BASE-gn$series${variant:+-$variant}-$sha"
+        if [[ "$GITHUB_REF" == refs/tags/gn-* ]]; then
+          name="$BASE-gn"
+          code=$series
+        else
+          name="$BASE-gn$series${variant:+-$variant}-$sha"
+          code=0
+        fi
         echo "version_name=$name" >> $GITHUB_OUTPUT
+        echo "version_code=$code" >> $GITHUB_OUTPUT
 
     - uses: actions/download-artifact@v7
       with:
@@ -187,6 +194,7 @@ jobs:
     - name: Assemble package
       env:
         VERSION_NAME: ${{ steps.version.outputs.version_name }}
+        VERSION_CODE: ${{ steps.version.outputs.version_code }}
         UPSTREAM: ${{ needs.source.outputs.upstream_ref }} ${{ needs.source.outputs.upstream_sha }}
       run: |
         mkdir -p pkg/system32
@@ -196,7 +204,7 @@ jobs:
         {
           "type": "FEXCore",
           "versionName": "$VERSION_NAME",
-          "versionCode": 0,
+          "versionCode": $VERSION_CODE,
           "description": "FEXCore $UPSTREAM + $patches GameNative patches",
           "files": [
             {
@@ -211,13 +219,13 @@ jobs:
         }
         JSON
         python3 -m json.tool pkg/profile.json
-        tar -cJf "FEXCore-$VERSION_NAME.wcp" -C pkg .
-        tar -tvJf "FEXCore-$VERSION_NAME.wcp"
+        tar -cJf "FEXCore-$VERSION_NAME-$VERSION_CODE.wcp" -C pkg .
+        tar -tvJf "FEXCore-$VERSION_NAME-$VERSION_CODE.wcp"
 
     - uses: actions/upload-artifact@v6
       with:
-        name: FEXCore-${{ steps.version.outputs.version_name }}
-        path: FEXCore-${{ steps.version.outputs.version_name }}.wcp
+        name: FEXCore-${{ steps.version.outputs.version_name }}-${{ steps.version.outputs.version_code }}
+        path: FEXCore-${{ steps.version.outputs.version_name }}-${{ steps.version.outputs.version_code }}.wcp
         if-no-files-found: error
         compression-level: 0
 
@@ -226,7 +234,7 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        gh release create "$GITHUB_REF_NAME" "FEXCore-${{ steps.version.outputs.version_name }}.wcp" \
+        gh release create "$GITHUB_REF_NAME" "FEXCore-${{ steps.version.outputs.version_name }}-${{ steps.version.outputs.version_code }}.wcp" \
           --repo "$GITHUB_REPOSITORY" --title "FEXCore ${{ steps.version.outputs.version_name }}" \
           --notes "Upstream ${{ needs.source.outputs.upstream_ref }} (${{ needs.source.outputs.upstream_sha }}) plus the GameNative patch series at ${{ github.sha }}" \
-          || gh release upload "$GITHUB_REF_NAME" "FEXCore-${{ steps.version.outputs.version_name }}.wcp" --repo "$GITHUB_REPOSITORY" --clobber
+          || gh release upload "$GITHUB_REF_NAME" "FEXCore-${{ steps.version.outputs.version_name }}-${{ steps.version.outputs.version_code }}.wcp" --repo "$GITHUB_REPOSITORY" --clobber

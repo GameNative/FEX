@@ -8,8 +8,11 @@ The `main` and `upstream-main` branches of this repository mirror upstream and a
 A patch that no longer applies fails the `source` job and names itself in the log. That is
 the signal to rebase it or drop it. A patch is dropped when upstream merges the fix.
 
-Version name: `<upstream release>-gn<SERIES_VERSION>-<branch sha>`, for example `2610-gn1-ab12cd3`.
-Bump `SERIES_VERSION` when the series changes.
+Version name: branch and PR builds are `<upstream release>-gn<SERIES_VERSION>-<branch sha>` with
+versionCode 0, for example `2610-gn1-ab12cd3`. A `gn-<n>` tag builds a release: versionName
+`<upstream release>-gn` with versionCode `SERIES_VERSION`, so the manifest id reads `2610-gn-4` and
+a later series installs next to it. Bump `SERIES_VERSION` when the series changes and tag the
+merged commit `gn-<SERIES_VERSION>` to release it.
 
 ## Series
 
