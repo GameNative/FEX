@@ -3,3 +3,4 @@
 0003-windows-anti-tamper-stepping-and-fault-delivery-.patch
 0004-arm64ec-export-btcpu64notifynonimageviews-so-ntd.patch
 0005-windows-make-volatile-code-regions-opt-in.patch
+0006-fexcore-fence-plain-loads-before-volatile-metadata-t.patch

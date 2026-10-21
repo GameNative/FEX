@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <dalal.utkarsh@gmail.com>
+Date: Wed, 21 Oct 2026 11:57:50 +0530
+Subject: [PATCH] FEXCore: fence plain loads before volatile-metadata TSO loads
+
+With PE volatile metadata, unlisted accesses in a covered block are emitted
+as plain loads and listed ones as ldapr. An acquire load does not keep an
+earlier plain load from completing after it, which x86 guarantees.
+
+Counter-Strike 2's CTSQueue pop reads the head sequence (listed), the tail
+sequence and node->next (unlisted), then re-reads the head sequence
+(listed). The unlisted loads drift past the re-check, a stale next passes
+it, and the game dies reading NULL+8 in tier0.dll / rendersystemdx11.dll
+a few minutes into a match.
+
+Emit dmb ishld before a metadata-forced TSO load when a plain load in a
+metadata block may precede it. A stress test running the same pop/push
+sequence under metadata livelocks or crashes within 2-5 s on the Odin 3
+without the fence and runs 60 s clean when those loads are ordered; the
+same code under Rosetta runs clean.
+---
+ FEXCore/Source/Interface/Core/Core.cpp          |  2 ++
+ .../Source/Interface/Core/OpcodeDispatcher.h    | 17 +++++++++++++++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index b0b4ad35b..5c79b2460 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -669,6 +669,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+         }
+       }
+ 
++      Thread->OpDispatcher->ResetMetadataLoadOrder(BlockInForceTSOValidRange);
++
+       // Set the block entry point
+       Thread->OpDispatcher->SetNewBlockIfChanged(Block.Entry);
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 85919f294..d973a24c8 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -332,6 +332,9 @@ public:
+   ForceTSOMode GetForceTSO() const {
+     return ForceTSO;
+   }
++  void ResetMetadataLoadOrder(bool InMetadataBlock) {
++    MetadataPlainLoadPending = InMetadataBlock;
++  }
+ 
+   void SetDumpIR(bool DumpIR) {
+     ShouldDump = DumpIR;
+@@ -1362,6 +1365,7 @@ private:
+   bool DecodeFailure {false};
+   bool NeedsBlockEnd {false};
+   ForceTSOMode ForceTSO {ForceTSOMode::NoOverride};
++  bool MetadataPlainLoadPending {false};
+   // Used during new op bringup
+   bool ShouldDump {false};
+ 
+@@ -2482,6 +2486,16 @@ private:
+   bool IsMonoBackpatcherBlock {false};
+   IROp_IRHeader* CurrentHeader {};
+ 
++  // x86 keeps loads in program order: a metadata-forced TSO load must not let earlier plain loads complete after it.
++  void OrderMetadataLoad(bool AtomicTSO) {
++    if (!AtomicTSO) {
++      MetadataPlainLoadPending |= ForceTSO == ForceTSOMode::ForceDisabled;
++    } else if (ForceTSO == ForceTSOMode::ForceEnabled && MetadataPlainLoadPending) {
++      _Fence(FenceType::Load);
++      MetadataPlainLoadPending = false;
++    }
++  }
++
+   [[nodiscard]]
+   bool IsTSOEnabled(RegClass Class) const {
+     if (ForceTSO == ForceTSOMode::ForceEnabled) {
+@@ -2510,6 +2524,7 @@ private:
+   }
+ 
+   Ref _LoadMemAutoTSO(RegClass Class, OpSize Size, Ref ssa0, OpSize Align = OpSize::i8Bit) {
++    OrderMetadataLoad(IsTSOEnabled(Class));
+     if (IsTSOEnabled(Class)) {
+       return _LoadMemTSO(Class, Size, ssa0, Invalid(), Align, MemOffsetType::SXTX, 1);
+     } else {
+@@ -2525,6 +2540,7 @@ private:
+ 
+   Ref _LoadMemAutoTSO(RegClass Class, OpSize Size, const AddressMode& A, OpSize Align = OpSize::i8Bit) {
+     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
++    OrderMetadataLoad(AtomicTSO);
+     const auto B = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, AtomicTSO, Class != RegClass::GPR, Size);
+ 
+     if (AtomicTSO) {
+@@ -2570,6 +2586,7 @@ private:
+ 
+     // Use ldp if possible, otherwise fallback on two loads.
+     if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
++      OrderMetadataLoad(false);
+       const auto B = SelectPairAddressMode(A, Size);
+       return LoadMemPair(Class, Size, B.Base, B.Offset);
+     }
