@@ -31,6 +31,9 @@ behaviour that is not a plain correctness fix is behind an env var.
 | 0008 codecache-rebase-relocation-offsets-to-the-code-buffer | GameNative | Since upstream #5840 relocation offsets are per compiled unit; the cache writer still stored them as code-buffer offsets, so every offline cache carried stale host pointers and un-rebased guest addresses. Offsets are rebased when a cache is generated or validated, and sorted on save | to be sent upstream |
 | 0009 fexofflinecompiler-quote-process-all-child-arguments | GameNative | `process-all` passed child arguments unquoted, so exe names with spaces broke | to be sent upstream |
 | 0010 codecache-copy-cached-code-to-a-writable-buffer-on-wow64 | GameNative | The WoW64 loader patched relocations into the read-only cache file mapping and killed the guest at start-up; it now gets a writable copy like ARM64EC (upstream #5658 covered ARM64EC only) | to be sent upstream |
+| 0011 wow64-handle-faults-before-the-first-thread-exists | GameNative | The WoW64 exception handler read the thread state without a null check; a fault during `BTCpuProcessInit` (cache validation) killed the process silently. The overcommit path now runs before any thread access | to be sent upstream |
+| 0012 codecache-restore-the-signal-handler-config-after-validation | GameNative | The validation context's `InitCore` overwrote the shared signal handler config | to be sent upstream |
+| 0013 codecache-log-the-load-phases | GameNative | INFO lines for each phase of an offline cache load (map, copy, relocate, register, finalize, enable), visible with `FEX_SILENTLOG=0` | GameNative only |
 
 Left out of 0003 on purpose: tarikbc 0002 (hides the emulator from the guest), 0007 (rewrites
 ntdll export bytes to pass one game's hook check), 0008 (debug tool), 0010 (obsolete on Proton

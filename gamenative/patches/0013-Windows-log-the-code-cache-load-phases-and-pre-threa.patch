@@ -1,0 +1,165 @@
+From 8a3f34ddbedfbebc906ce5effe1b05de1ec33662 Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <utkarsh.dalal@toptal.com>
+Date: Wed, 28 Oct 2026 19:15:01 +0530
+Subject: [PATCH 13/13] Windows: log the code cache load phases and pre-thread
+ exceptions
+
+A failure while loading a code cache from BTCpuProcessInit used to end
+the process without output. Report each step of the load at info level
+so a single run shows how far it got:
+
+- the mapped cache view, or the NTSTATUS when the section or view
+  cannot be created
+- the writable copy of the cached code with its protection
+- block and code page registration, finalization and validation
+- completion of the load for each image
+
+On WOW64, also report exceptions taken before BTCpuThreadInit has set
+up a thread state, and overcommit ranges committed in that window.
+---
+ FEXCore/Source/Interface/Core/CodeCache.cpp | 14 ++++++
+ Source/Windows/Common/ImageTracker.cpp      | 53 ++++++++++++---------
+ Source/Windows/WOW64/Module.cpp             |  4 ++
+ 3 files changed, 48 insertions(+), 23 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+index d9ee36b..1fbaa12 100644
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -401,6 +401,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
+       ERROR_AND_DIE_FMT("Failed to create cache load validation context");
+     }
+     CTX.SignalDelegation->SetConfig(SignalConfig);
++    LogMan::Msg::IFmt("Cache validation: context ready");
+ 
+     ValidationThread.reset(ValidationCTX->CreateThread(nullptr));
+ 
+@@ -731,6 +732,13 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
+     return nullptr;
+   }
+   auto CodeBuffer = std::span {reinterpret_cast<std::byte*>(CodeBufferAllocation), header.CodeBufferSize};
++  {
++    MEMORY_BASIC_INFORMATION Info {};
++    ::VirtualQuery(CodeBufferAllocation, &Info, sizeof(Info));
++    LogMan::Msg::IFmt("Cache map: file {} ({:#x} bytes); code {:#x} bytes at file offset {:#x} copied to {} (protect {:#x}); {} relocations",
++                      fmt::ptr(CacheFile.data()), CacheFile.size_bytes(), header.CodeBufferSize, CodeDataInFile.data() - CacheFile.data(),
++                      CodeBufferAllocation, Info.Protect, header.NumRelocations);
++  }
+ #endif
+ 
+   // Group relocations by page
+@@ -846,6 +854,8 @@ bool CodeCache::EnableLoadedSection(Core::InternalThreadState* Thread, MappedCod
+       }
+     }
+   }
++  LogMan::Msg::IFmt("Cache load: registered {} blocks and {} code pages; host code {}-{}", BlockList.size(), Code.NumCodePages,
++                    fmt::ptr(Code.CodeBuffer.data()), fmt::ptr(Code.CodeBuffer.data() + Code.CodeBuffer.size_bytes()));
+ 
+ #ifndef _WIN32
+   if (!EnableLazyCodeCaching || EnableCodeCacheValidation) {
+@@ -854,7 +864,9 @@ bool CodeCache::EnableLoadedSection(Core::InternalThreadState* Thread, MappedCod
+   if (true) {
+ #endif
+     auto Range = SelectCodeRangeToFinalize(Code, 0, Code.CodeBuffer.size_bytes() / Utils::FEX_PAGE_SIZE);
++    LogMan::Msg::IFmt("Cache load: finalizing {} pages at {}", Range.size_bytes() / Utils::FEX_PAGE_SIZE, fmt::ptr(Range.data()));
+     FinalizeCodePages(Code, Range);
++    LogMan::Msg::IFmt("Cache load: finalized; guest base {:#x}", Code.GuestBase);
+   }
+ 
+   if (EnableCodeCacheValidation) {
+@@ -864,9 +876,11 @@ bool CodeCache::EnableLoadedSection(Core::InternalThreadState* Thread, MappedCod
+       HostBlocks.insert(Host.HostCode);
+     }
+ 
++    LogMan::Msg::IFmt("Cache load: validating {} guest blocks", GuestBlocks.size());
+     Validate(BinarySection, std::move(GuestBlocks), HostBlocks, Code.CodeBuffer);
+   }
+ 
++  LogMan::Msg::IFmt("Cache load: enabled {}", BinarySection.FileInfo.Filename);
+   return true;
+ }
+ 
+diff --git a/Source/Windows/Common/ImageTracker.cpp b/Source/Windows/Common/ImageTracker.cpp
+index c459c44..fbe74ee 100644
+--- a/Source/Windows/Common/ImageTracker.cpp
++++ b/Source/Windows/Common/ImageTracker.cpp
+@@ -246,29 +246,36 @@ void ImageTracker::LoadAOTImages(MappedImageInfo& ImageInfo) {
+   ScopedHandle FileHandle;
+   if (NT_SUCCESS(NtOpenFile(&*FileHandle, GENERIC_READ | SYNCHRONIZE, &FileAttr, &IOSB, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_NONALERT))) {
+     ScopedHandle SectionHandle;
+-    if (NT_SUCCESS(NtCreateSection(&*SectionHandle, SECTION_MAP_EXECUTE | SECTION_MAP_READ, nullptr, nullptr, PAGE_EXECUTE_READ, SEC_COMMIT,
+-                                   *FileHandle))) {
+-      void* LoadAddress = nullptr;
+-      SIZE_T MappedSize = 0;
+-      // TODO: Consider NtMapViewOfSectionEx with MEM_EXTENDED_PARAMETER_EC_CODE;
+-      //       instead, we're eagerly copying all cache data to a dedicated buffer currently
+-      // MEM_EXTENDED_PARAMETER ECParam {};
+-      // ECParam.Type = MemExtendedParameterAttributeFlags;
+-      // ECParam.ULong64 = MEM_EXTENDED_PARAMETER_EC_CODE;
+-      if (NT_SUCCESS(NtMapViewOfSection(*SectionHandle, NtCurrentProcess(), &LoadAddress, 0, 0, nullptr, &MappedSize, ViewUnmap,
+-                                        MEM_RESERVE | MEM_TOP_DOWN, PAGE_EXECUTE_READ))) {
+-
+-        auto CacheSpan = std::span {static_cast<std::byte*>(LoadAddress), MappedSize};
+-        auto MappedCache = CTX.GetCodeCache().LoadCache(CacheSpan, ImageInfo.Info, ImageInfo.SectionInfo.FileStartVA);
+-        if (MappedCache) {
+-          CTX.GetCodeCache().RegisterMappedCodeBuffer(*MappedCache);
+-          AOTImages[ID] = {.CacheFile = std::move(MappedCache)};
+-          LogMan::Msg::IFmt("Loaded cache: {}", ID);
+-        } else {
+-          NtUnmapViewOfSection(NtCurrentProcess(), LoadAddress);
+-          LogMan::Msg::EFmt("Failed to load cache: {}", ID);
+-        }
+-      }
++    NTSTATUS Status = NtCreateSection(&*SectionHandle, SECTION_MAP_EXECUTE | SECTION_MAP_READ, nullptr, nullptr, PAGE_EXECUTE_READ, SEC_COMMIT,
++                                      *FileHandle);
++    if (!NT_SUCCESS(Status)) {
++      LogMan::Msg::EFmt("Failed to create cache section for {}: {:#x}", ID, static_cast<uint32_t>(Status));
++      return;
++    }
++    void* LoadAddress = nullptr;
++    SIZE_T MappedSize = 0;
++    // TODO: Consider NtMapViewOfSectionEx with MEM_EXTENDED_PARAMETER_EC_CODE;
++    //       instead, we're eagerly copying all cache data to a dedicated buffer currently
++    // MEM_EXTENDED_PARAMETER ECParam {};
++    // ECParam.Type = MemExtendedParameterAttributeFlags;
++    // ECParam.ULong64 = MEM_EXTENDED_PARAMETER_EC_CODE;
++    Status = NtMapViewOfSection(*SectionHandle, NtCurrentProcess(), &LoadAddress, 0, 0, nullptr, &MappedSize, ViewUnmap,
++                                MEM_RESERVE | MEM_TOP_DOWN, PAGE_EXECUTE_READ);
++    if (!NT_SUCCESS(Status)) {
++      LogMan::Msg::EFmt("Failed to map cache view for {}: {:#x}", ID, static_cast<uint32_t>(Status));
++      return;
++    }
++    LogMan::Msg::IFmt("Mapped cache view: {} at {} ({:#x} bytes)", ID, LoadAddress, MappedSize);
++
++    auto CacheSpan = std::span {static_cast<std::byte*>(LoadAddress), MappedSize};
++    auto MappedCache = CTX.GetCodeCache().LoadCache(CacheSpan, ImageInfo.Info, ImageInfo.SectionInfo.FileStartVA);
++    if (MappedCache) {
++      CTX.GetCodeCache().RegisterMappedCodeBuffer(*MappedCache);
++      AOTImages[ID] = {.CacheFile = std::move(MappedCache)};
++      LogMan::Msg::IFmt("Loaded cache: {}", ID);
++    } else {
++      NtUnmapViewOfSection(NtCurrentProcess(), LoadAddress);
++      LogMan::Msg::EFmt("Failed to load cache: {}", ID);
+     }
+   }
+ }
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index fc56048..8bd2c8c 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -734,8 +734,12 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+     // BTCpuProcessInit runs before any thread state exists, and loading code caches there can touch overcommitted memory
+     if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && OvercommitTracker &&
+         OvercommitTracker->HandleAccessViolation(static_cast<uint64_t>(Exception->ExceptionInformation[1]))) {
++      LogMan::Msg::IFmt("Committed overcommit range at {:X} before thread setup", Exception->ExceptionInformation[1]);
+       return true;
+     }
++    LogMan::Msg::EFmt("Unhandled exception {:X} before thread setup: pc {:X}, info {:X} {:X}", Exception->ExceptionCode, Context->Pc,
++                      Exception->NumberParameters > 0 ? Exception->ExceptionInformation[0] : 0,
++                      Exception->NumberParameters > 1 ? Exception->ExceptionInformation[1] : 0);
+     return false;
+   }
+ 
+-- 
+2.43.0
+

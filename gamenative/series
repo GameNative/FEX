@@ -8,3 +8,6 @@
 0008-CodeCache-rebase-relocation-offsets-to-the-code-buff.patch
 0009-FEXOfflineCompiler-quote-process-all-child-arguments.patch
 0010-CodeCache-copy-cached-code-to-a-writable-buffer-on-W.patch
+0011-WOW64-handle-exceptions-raised-before-the-first-thre.patch
+0012-CodeCache-keep-the-main-dispatcher-config-when-creat.patch
+0013-Windows-log-the-code-cache-load-phases-and-pre-threa.patch

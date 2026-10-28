@@ -1,0 +1,38 @@
+From 3f8e27dad05e35c2cb037a4af4701d46db09973d Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <utkarsh.dalal@toptal.com>
+Date: Wed, 28 Oct 2026 19:10:47 +0530
+Subject: [PATCH 12/13] CodeCache: keep the main dispatcher config when
+ creating the validation context
+
+ValidationCTX shares the main context's SignalDelegator, and InitCore
+replaces the delegator config with one describing the validation
+context's dispatcher. Every later exception or suspend handled for the
+main context then checks dispatcher ranges and resume addresses of a
+dispatcher that never runs guest code.
+
+Save the config before initializing the validation context and restore
+it afterwards.
+---
+ FEXCore/Source/Interface/Core/CodeCache.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+index 67bdb89..d9ee36b 100644
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -395,9 +395,12 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
+     ValidationCTX->SetSignalDelegator(CTX.SignalDelegation);
+     ValidationCTX->SetSyscallHandler(CTX.SyscallHandler);
+     ValidationCTX->SetThunkHandler(CTX.ThunkHandler);
++    // InitCore points the shared SignalDelegator at the validation context's dispatcher; keep the main one
++    const auto SignalConfig = CTX.SignalDelegation->GetConfig();
+     if (!ValidationCTX->InitCore()) {
+       ERROR_AND_DIE_FMT("Failed to create cache load validation context");
+     }
++    CTX.SignalDelegation->SetConfig(SignalConfig);
+ 
+     ValidationThread.reset(ValidationCTX->CreateThread(nullptr));
+ 
+-- 
+2.43.0
+
