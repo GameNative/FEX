@@ -1,0 +1,48 @@
+From a16bec59351f3f756fdb22908014929ebb2f44fd Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <utkarsh.dalal@toptal.com>
+Date: Wed, 28 Oct 2026 19:14:50 +0530
+Subject: [PATCH 11/13] WOW64: handle exceptions raised before the first thread
+ is set up
+
+Code caches for the main executable are loaded from BTCpuProcessInit,
+before BTCpuThreadInit has stored a thread state in the TEB. With
+FEX_ENABLECODECACHEVALIDATION set, Validate compiles the cached blocks
+on a separate context, and CompileCode's FindBlock reads that context's
+LookupCache, which is reserved without being committed. The resulting
+access violation is meant to be resolved by the OvercommitTracker.
+
+BTCpuResetToConsistentStateImpl dereferences the thread state in
+FEXCORE_PROFILE_ACCUMULATION before checking it, so the handler itself
+faults and the process terminates without any log output. Since the
+dereference comes first, the compiler also drops the later null checks.
+
+Handle the case without a thread state before touching it: resolve
+overcommit faults and leave everything else to the regular dispatch.
+---
+ Source/Windows/WOW64/Module.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 8c6b7f7..fc56048 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -729,6 +729,16 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+   auto* Context = Ptrs->ContextRecord;
+   auto* Exception = Ptrs->ExceptionRecord;
+   auto Thread = GetTLS().ThreadState();
++
++  if (!Thread) {
++    // BTCpuProcessInit runs before any thread state exists, and loading code caches there can touch overcommitted memory
++    if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && OvercommitTracker &&
++        OvercommitTracker->HandleAccessViolation(static_cast<uint64_t>(Exception->ExceptionInformation[1]))) {
++      return true;
++    }
++    return false;
++  }
++
+   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedSignalTime);
+ 
+   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+-- 
+2.43.0
+
