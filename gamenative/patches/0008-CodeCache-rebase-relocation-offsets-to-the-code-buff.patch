@@ -1,0 +1,131 @@
+From 65bbc2cd0527fddccd8f55742f2d9edb2ce2c53b Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <dalal.utkarsh@gmail.com>
+Date: Wed, 28 Oct 2026 18:28:42 +0530
+Subject: [PATCH 08/10] CodeCache: rebase relocation offsets to the code buffer
+ when serializing
+
+Since ad3939a44 ("Avoid double offset relocations") relocation offsets
+are relative to the start of their compile unit. That works for the
+disk cache, which stores one unit at a time, but code cache generation
+and validation accumulate relocations across all units of a binary
+and apply them to the whole code buffer.
+
+The result was that every unit's relocations were applied to the first
+few pages of the buffer: generated caches kept the host address of the
+ExitFunctionLinker and unrelocated guest addresses in all but the first
+unit, the relocation list was no longer sorted (breaking the per-page
+grouping in LoadCache), and loading patched garbage into the first
+pages.
+
+Rebase the offsets by the unit's code buffer offset when the JIT
+compiles for cache generation and when Validate compiles reference
+code, sort the serialized list by offset, and let the lazy finalization
+path on Linux pass the offset of its staging window.
+---
+ FEXCore/Source/Interface/Context/Context.h  |  4 +++-
+ FEXCore/Source/Interface/Core/CodeCache.cpp | 19 ++++++++++++++-----
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp   |  7 +++++++
+ 3 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index a889086..f124325 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -122,11 +122,13 @@ public:
+    *
+    * @param GuestDelta Guest address offset to apply to RIP-relative data
+    * @param ForStorage True for serializing data (producing deterministic output); false for de-serializing it (resolving dynamic symbols)
++   * @param CodeOffset Offset of Code within the buffer that relocation offsets are relative to
+    *
+    * @return Returns true on success
+    */
+   [[nodiscard]]
+-  bool ApplyCodeRelocations(uint64_t GuestDelta, std::span<std::byte> Code, std::span<const CPU::Relocation> Relocations, bool ForStorage);
++  bool ApplyCodeRelocations(uint64_t GuestDelta, std::span<std::byte> Code, std::span<const CPU::Relocation> Relocations, bool ForStorage,
++                            uint64_t CodeOffset = 0);
+ 
+   // Same but on disk cache packed relocations
+   [[nodiscard]]
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+index 87a110c..7ddcf18 100644
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -298,6 +298,8 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
+   auto CodeBuffer = CTX.GetLatest();
+   auto& LookupCache = *Thread.LookupCache->Shared;
+   auto Relocations = Thread.CPUBackend->TakeRelocations(SourceBinary.FileStartVA);
++  // Loading groups relocations by code page, which requires them to be sorted by offset
++  std::ranges::stable_sort(Relocations, std::less {}, [](const CPU::Relocation& Reloc) { return Reloc.Header.Offset; });
+ 
+   // Write file header
+   CodeCacheHeader header {};
+@@ -425,15 +427,21 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
+     std::as_writable_bytes(std::span {NewCodeBuffer->GetBufferBase(), NewCodeBuffer->GetBufferBase() + NewCodeBuffer->UsableSize()})
+       .subspan(0, CachedCode.size_bytes());
+ 
++  fextl::vector<CPU::Relocation> NewRelocations;
+   while (!GuestBlocks.empty()) {
+     auto [CompiledBlocks, _, _2, _3, _4] = ValidationCTX->CompileCode(ValidationThread.get(), *GuestBlocks.begin(), 0 /* TODO: Set MaxInst? */);
+     for (auto& Entry : CompiledBlocks.EntryPoints) {
+       GuestBlocks.erase(Entry.first);
+     }
++
++    // Relocation offsets are relative to their compile unit; rebase them to the CodeBuffer start
++    for (auto& Reloc : ValidationThread->CPUBackend->TakeRelocations(Section.FileStartVA)) {
++      Reloc.Header.Offset += CompiledBlocks.HostCodeOffset;
++      NewRelocations.push_back(Reloc);
++    }
+   }
+ 
+   // Patch FEX-internal function addresses with values from the main Context to ensure the code blocks are comparable
+-  auto NewRelocations = ValidationThread->CPUBackend->TakeRelocations(Section.FileStartVA);
+   NewRelocations.erase(std::remove_if(NewRelocations.begin(), NewRelocations.end(), [](const CPU::Relocation& Reloc) {
+     return Reloc.Header.Type != CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL && Reloc.Header.Type != CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE;
+   }));
+@@ -616,12 +624,13 @@ bool CodeCache::ApplyPackedCodeRelocations(uint64_t GuestEntry, std::span<std::b
+ }
+ 
+ bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> Code,
+-                                     std::span<const FEXCore::CPU::Relocation> EntryRelocations, bool ForStorage) {
++                                     std::span<const FEXCore::CPU::Relocation> EntryRelocations, bool ForStorage, uint64_t CodeOffset) {
+   CPU::Arm64Emitter Emitter(&CTX, Code.data(), Code.size_bytes());
+   for (size_t j = 0; j < EntryRelocations.size(); ++j) {
+     const FEXCore::CPU::Relocation& Reloc = EntryRelocations[j];
+-    LOGMAN_THROW_A_FMT(Reloc.Header.Offset < Code.size_bytes(), "Invalid relocation offset");
+-    Emitter.SetCursorOffset(Reloc.Header.Offset);
++    LOGMAN_THROW_A_FMT(Reloc.Header.Offset >= CodeOffset, "Invalid relocation offset");
++    LOGMAN_THROW_A_FMT(Reloc.Header.Offset - CodeOffset < Code.size_bytes(), "Invalid relocation offset");
++    Emitter.SetCursorOffset(Reloc.Header.Offset - CodeOffset);
+ 
+     switch (Reloc.Header.Type) {
+     case FEXCore::CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL: {
+@@ -970,7 +979,7 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
+   auto StagingSpan = std::span {Staging, Size};
+   for (size_t i = StartPage; i < EndPage; ++i) {
+     auto PageRelocations = SpanPageRelocations(Code, i);
+-    (void)ApplyCodeRelocations(Code.GuestBase, StagingSpan, PageRelocations, false);
++    (void)ApplyCodeRelocations(Code.GuestBase, StagingSpan, PageRelocations, false, StartOffset);
+     Code.LoadedPages[i] = true;
+   }
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 58b2fe4..b7a7ebb 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -1167,6 +1167,13 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+     memcpy(AllocatedInfo.BufferAllocationOffset, TempCodeBuffer, CodeData.Size);
+   }
+ 
++  // Relocations accumulate across compile units while generating a code cache, so make them relative to the CodeBuffer base
++  if (CTX->GetCodeCache().IsGeneratingCache) {
++    for (auto& Relocation : std::span {Relocations}.subspan(PrevNumAllocations)) {
++      Relocation.Header.Offset += CodeData.HostCodeOffset;
++    }
++  }
++
+   TempCodeBufferAllocator.DelayedDisownBuffer();
+ 
+   ClearICache(CodeBegin, CodeOnlySize);
+-- 
+2.43.0
+

@@ -154,7 +154,9 @@ jobs:
     - uses: actions/upload-artifact@v6
       with:
         name: dll-${{ matrix.target }}
-        path: fex/install/usr/lib/wine/aarch64-windows/lib*.dll
+        path: |
+          fex/install/usr/lib/wine/aarch64-windows/lib*.dll
+          fex/build/Bin/FEXOfflineCompiler*.exe
         if-no-files-found: error
         retention-days: 7
 
@@ -199,6 +201,7 @@ jobs:
       run: |
         mkdir -p pkg/system32
         cp dlls/libarm64ecfex.dll dlls/libwow64fex.dll pkg/system32/
+        cp dlls/FEXOfflineCompiler64.exe dlls/FEXOfflineCompiler32.exe pkg/system32/
         patches=$(grep -c -v -e '^#' -e '^$' gamenative/series)
         cat > pkg/profile.json <<JSON
         {
@@ -214,6 +217,14 @@ jobs:
             {
               "source": "system32/libwow64fex.dll",
               "target": "\${system32}/libwow64fex.dll"
+            },
+            {
+              "source": "system32/FEXOfflineCompiler64.exe",
+              "target": "\${system32}/FEXOfflineCompiler64.exe"
+            },
+            {
+              "source": "system32/FEXOfflineCompiler32.exe",
+              "target": "\${system32}/FEXOfflineCompiler32.exe"
             }
           ]
         }

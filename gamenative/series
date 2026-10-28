@@ -4,3 +4,7 @@
 0004-arm64ec-export-btcpu64notifynonimageviews-so-ntd.patch
 0005-windows-make-volatile-code-regions-opt-in.patch
 0006-fexcore-fence-plain-loads-before-volatile-metadata-t.patch
+0007-FEXOfflineCompiler-load-the-config-before-initializi.patch
+0008-CodeCache-rebase-relocation-offsets-to-the-code-buff.patch
+0009-FEXOfflineCompiler-quote-process-all-child-arguments.patch
+0010-CodeCache-copy-cached-code-to-a-writable-buffer-on-W.patch
