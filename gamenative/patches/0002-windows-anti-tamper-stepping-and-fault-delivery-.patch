@@ -14,25 +14,27 @@ Left out: 0002 (hides the emulator), 0007 (rewrites ntdll export bytes), 0008 (d
 0010 (obsolete on Proton 11.0-2), 0016 (hooks powrprof; belongs in Wine, bug 60462).
 
 Upstream: FEX-Emu/FEX#6022 (0012/0014), #6023 (0004); 0006 reported as Wine bug 60461.
+
+Rebased onto FEX-2611: trapless fault delivery (0017, FEX_EXP_FASTTRAP) is upstream now
+(27cfd41bf, 07abec317: SupportsFaultFreeSynchronousFaults), so that half is dropped along with
+the env var; only the fast raise into KiUserExceptionDispatcher stays, hooked into RaiseException.
 ---
  FEXCore/Source/Interface/Context/Context.h    |  30 ++
  FEXCore/Source/Interface/Core/CPUBackend.h    |   7 +
- FEXCore/Source/Interface/Core/Core.cpp        | 320 ++++++++++++++++-
- .../Interface/Core/Dispatcher/Dispatcher.cpp  |  21 ++
+ FEXCore/Source/Interface/Core/Core.cpp        | 320 +++++++++++++++++-
  FEXCore/Source/Interface/Core/JIT/JIT.cpp     |   4 +
  .../Core/SharedCodeBufferManager.cpp          |   6 +-
  .../Interface/Core/SharedCodeBufferManager.h  |   2 +
  FEXCore/include/FEXCore/Core/Context.h        |   5 +
- FEXCore/include/FEXCore/Core/CoreState.h      |   1 +
  .../FEXCore/Debug/InternalThreadState.h       |   5 +
  Source/Windows/ARM64EC/Module.S               |  26 ++
- Source/Windows/ARM64EC/Module.cpp             | 331 +++++++++++++++++-
+ Source/Windows/ARM64EC/Module.cpp             | 270 ++++++++++++++-
  Source/Windows/Common/InvalidationTracker.cpp | 140 +++++++-
  Source/Windows/Common/InvalidationTracker.h   |  18 +
- 14 files changed, 908 insertions(+), 8 deletions(-)
+ 12 files changed, 825 insertions(+), 8 deletions(-)
 
 diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
-index 9f427da20..a8890860c 100644
+index 9b91055bd..01b1f8133 100644
 --- a/FEXCore/Source/Interface/Context/Context.h
 +++ b/FEXCore/Source/Interface/Context/Context.h
 @@ -152,6 +152,10 @@ public:
@@ -46,7 +48,7 @@ index 9f427da20..a8890860c 100644
    uint32_t ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs, uint64_t PSTATE) override;
    void SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, uint32_t EFLAGS) override;
  
-@@ -515,6 +519,32 @@ private:
+@@ -516,6 +520,32 @@ private:
    bool MonoDetected = false;
    std::atomic<uint64_t> MonoBackpatcherBlock;
  
@@ -80,7 +82,7 @@ index 9f427da20..a8890860c 100644
    fextl::vector<std::weak_ptr<CPU::CodeBuffer>> CodeBufferList;
  };
 diff --git a/FEXCore/Source/Interface/Core/CPUBackend.h b/FEXCore/Source/Interface/Core/CPUBackend.h
-index 0183694cd..cb08a295e 100644
+index 1d19bc123..211933e82 100644
 --- a/FEXCore/Source/Interface/Core/CPUBackend.h
 +++ b/FEXCore/Source/Interface/Core/CPUBackend.h
 @@ -138,6 +138,13 @@ namespace CPU {
@@ -98,7 +100,7 @@ index 0183694cd..cb08a295e 100644
      // Max spill slot size in bytes. We need at most 32 bytes
      // to be able to handle a 256-bit vector store to a slot.
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index b11fae62d..4802fdd50 100644
+index 53d81a872..3c6101205 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
 @@ -9,6 +9,7 @@ $end_info$
@@ -224,7 +226,7 @@ index b11fae62d..4802fdd50 100644
      const auto& CodeBlocks = BlockInfo->Blocks;
  
      Thread->OpDispatcher->BeginFunction(GuestRIP, &CodeBlocks, BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode,
-@@ -866,6 +947,212 @@ struct CompileDepthScope {
+@@ -872,6 +953,212 @@ struct CompileDepthScope {
  };
  } // namespace
  
@@ -437,15 +439,14 @@ index b11fae62d..4802fdd50 100644
  uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
    if constexpr (BLOCK_DEBUGGING) {
      // Block debugging logic is hand-written and needs to be handled with care.
-@@ -902,9 +1189,20 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
-   if (FEXCore::UncheckedLongJump::SetJump(Thread->CompileRestartJump)) {
+@@ -909,8 +1196,19 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
      Thread->FrontendDecoder->ResetExecutableRangeCache();
    }
-+
+ 
 +  if (IsVolatileCode(GuestRIP)) {
 +    return CompileVolatileBlock(Thread, GuestRIP);
 +  }
- 
++
    Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
  
 +
@@ -458,7 +459,7 @@ index b11fae62d..4802fdd50 100644
    std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
    std::optional<DiskCache::CodeHitData> Hit;
    std::optional<uint64_t> DiskCacheGuestCodeKey;
-@@ -1040,6 +1338,19 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+@@ -1046,6 +1344,19 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
      Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
    }
  
@@ -478,7 +479,7 @@ index b11fae62d..4802fdd50 100644
    // Clear any relocations that might have been generated
    if (!CodeCache.IsGeneratingCache) {
      Thread->CPUBackend->ClearRelocations();
-@@ -1102,7 +1413,14 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
+@@ -1108,7 +1419,14 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
    // Accessing FrontendDecoder is safe as the thread's code invalidation mutex must be locked here.
    Thread->FrontendDecoder->ResetExecutableRangeCache();
  
@@ -494,57 +495,11 @@ index b11fae62d..4802fdd50 100644
      FEXCORE_PROFILE_SCOPED("InvalidateCallRet");
  
      // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
-diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
-index df48ca153..aa03d362e 100644
---- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
-+++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
-@@ -404,6 +404,13 @@ void Dispatcher::EmitDispatcher() {
- 
-     SpillStaticRegs(TMP1);
- 
-+    // Patch 0017: a frontend may take this guest fault directly (no host trap) through a per-thread pointer.
-+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignalTrapNative));
-+    ARMEmitter::ForwardLabel NoNativeSIGILL;
-+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NoNativeSIGILL);
-+    br(TMP1);
-+    (void)Bind(&NoNativeSIGILL);
-+
-     hlt(0);
-   }
- 
-@@ -414,6 +421,13 @@ void Dispatcher::EmitDispatcher() {
- 
-     SpillStaticRegs(TMP1);
- 
-+    // Patch 0017: a frontend may take this guest fault directly (no host trap) through a per-thread pointer.
-+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignalTrapNative));
-+    ARMEmitter::ForwardLabel NoNativeSIGTRAP;
-+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NoNativeSIGTRAP);
-+    br(TMP1);
-+    (void)Bind(&NoNativeSIGTRAP);
-+
-     brk(0);
-   }
- 
-@@ -424,6 +438,13 @@ void Dispatcher::EmitDispatcher() {
- 
-     SpillStaticRegs(TMP1);
- 
-+    // Patch 0017: a frontend may take this guest fault directly (no host trap) through a per-thread pointer.
-+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignalTrapNative));
-+    ARMEmitter::ForwardLabel NoNativeSIGSEGV;
-+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NoNativeSIGSEGV);
-+    br(TMP1);
-+    (void)Bind(&NoNativeSIGSEGV);
-+
-     // hlt/udf = SIGILL
-     // brk = SIGTRAP
-     // ??? = SIGSEGV
 diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
-index ef7e33299..58b2fe461 100644
+index 551dc1a08..dd647cfa9 100644
 --- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
-@@ -584,6 +584,10 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
+@@ -558,6 +558,10 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
        // Hold a reference to the code buffer, to avoid linking unmapped code if compilation triggers a recreation.
        auto CodeBuffer = static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
        HostCode = static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlock(Frame, GuestRip, 0);
@@ -615,18 +570,6 @@ index 8aa448e2e..3524bcede 100644
    ///< State reconstruction helpers
    ///< Reconstructs the guest RIP from the passed in thread context and related Host PC.
    FEX_DEFAULT_VISIBILITY virtual uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) = 0;
-diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
-index 80514bfdc..e27507efe 100644
---- a/FEXCore/include/FEXCore/Core/CoreState.h
-+++ b/FEXCore/include/FEXCore/Core/CoreState.h
-@@ -375,6 +375,7 @@ struct JITPointers {
-   uint64_t ThreadDispatchRemoveCodeEntry {};
-   uint64_t GuestSignal_SIGILL {};
-   uint64_t GuestSignal_SIGTRAP {};
-+  uint64_t GuestSignalTrapNative {}; // Patch 0017: when set, the guest-signal stubs branch here instead of trapping
-   uint64_t GuestSignal_SIGSEGV {};
-   uint64_t SignalReturnHandler {};
-   uint64_t SignalReturnHandlerRT {};
 diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
 index 7d6cb2018..935c7cb73 100644
 --- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
@@ -644,7 +587,7 @@ index 7d6cb2018..935c7cb73 100644
    uint64_t JITGuardOverflowArgument {};
    FEXCore::UncheckedLongJump::JumpBuf RestartJump;
 diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
-index ce36c1d68..bf5ee5b34 100644
+index 4d9fd8b7e..0ceed511b 100644
 --- a/Source/Windows/ARM64EC/Module.S
 +++ b/Source/Windows/ARM64EC/Module.S
 @@ -147,6 +147,32 @@ DIRECT_SYSCALL_WRAPPER("#NtRaiseExceptionNative", WineNtRaiseExceptionSyscallId)
@@ -681,7 +624,7 @@ index ce36c1d68..bf5ee5b34 100644
    // A replacement for the standard ARM64EC call checker that ignores any FFS patches and always redirects to a function's
    // native implementation. As the only library FEX calls into is NTDLL, this is done using a LUT generated at init time.
 diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
-index ab908b0fa..3e7744cce 100644
+index 4b8149bf3..8914f2c35 100644
 --- a/Source/Windows/ARM64EC/Module.cpp
 +++ b/Source/Windows/ARM64EC/Module.cpp
 @@ -91,8 +91,27 @@ uint64_t WineNtContinueSyscallId;
@@ -712,7 +655,7 @@ index ab908b0fa..3e7744cce 100644
  NTSTATUS NtAllocateVirtualMemoryNative(HANDLE, PVOID*, ULONG_PTR, SIZE_T*, ULONG, ULONG);
  NTSTATUS NtProtectVirtualMemoryNative(HANDLE, PVOID*, SIZE_T*, ULONG, ULONG*);
  NTSTATUS NtRaiseExceptionNative(EXCEPTION_RECORD*, ARM64_NT_CONTEXT*, BOOL);
-@@ -268,6 +287,8 @@ void ParseWineSyscallNumbers(HMODULE NtDll) {
+@@ -270,6 +289,8 @@ void ParseWineSyscallNumbers(HMODULE NtDll) {
        WineNtProtectVirtualMemorySyscallId = CurSyscallId;
      } else if (strcmp(it->Name, "NtRaiseException") == 0) {
        WineNtRaiseExceptionSyscallId = CurSyscallId;
@@ -721,7 +664,7 @@ index ab908b0fa..3e7744cce 100644
      }
    }
  }
-@@ -324,6 +345,7 @@ bool InitSyscalls() {
+@@ -326,6 +347,7 @@ bool InitSyscalls() {
  
    const auto WineSyscallDispatcherPtr = reinterpret_cast<void**>(GetProcAddress(NtDll, "__wine_syscall_dispatcher"));
    if (WineSyscallDispatcherPtr) {
@@ -729,7 +672,7 @@ index ab908b0fa..3e7744cce 100644
      WineSyscallDispatcher = *WineSyscallDispatcherPtr;
      ParseWineSyscallNumbers(NtDll);
    } else {
-@@ -571,6 +593,89 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+@@ -655,6 +677,33 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
    return ECContext;
  }
  
@@ -760,66 +703,10 @@ index ab908b0fa..3e7744cce 100644
 +  NtRaiseExceptionNative(&GuestRec, &GuestContext, FirstChance);
 +}
 +
-+struct FastTrapStatsType {
-+  uint64_t Marker; // "FASTTRP1"
-+  uint64_t Taken;
-+  uint64_t Fallback;
-+  uint64_t Ill, Trap, Segv;
-+};
-+FastTrapStatsType FastTrapStats = {0x3150525454534146ULL, 0, 0, 0, 0, 0}; // "FASTTRP1"
-+static bool FastTrapEnabled = [] { const char* E = getenv("FEX_EXP_FASTTRAP"); return !(E && E[0] == '0'); }();
-+static void FastRaiseOrNative(EXCEPTION_RECORD& GuestRec, ARM64_NT_CONTEXT& GuestContext, BOOL FirstChance);
-+
-+// Patch 0017: entered from FEXCore's guest-signal stubs (SIGILL/SIGTRAP/SIGSEGV breaks of JIT code: ud2, int3, int n,
-+// trap-flag steps) with the static registers spilled, on the emulator stack, instead of a hlt/brk host trap. Builds the
-+// guest exception as RethrowGuestException does after that trap, without the trap, the signal handler and the first
-+// KiUserExceptionDispatcher pass. FEX_EXP_FASTTRAP=0 turns it off. Never returns.
-+extern "C" __attribute__((noreturn)) void FastTrapEntry() {
-+  uint64_t FPCR, FPSR;
-+  __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
-+  __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
-+  auto* Thread = GetCPUArea().ThreadState();
-+  auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
-+  if (Fault.Signal == FEXCore::Core::FAULT_SIGILL) {
-+    __atomic_fetch_add(&FastTrapStats.Ill, 1, __ATOMIC_RELAXED);
-+  } else if (Fault.Signal == FEXCore::Core::FAULT_SIGTRAP) {
-+    __atomic_fetch_add(&FastTrapStats.Trap, 1, __ATOMIC_RELAXED);
-+  } else {
-+    __atomic_fetch_add(&FastTrapStats.Segv, 1, __ATOMIC_RELAXED);
-+  }
-+  ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR));
-+
-+  // As RethrowGuestException: x64 clears TF when an exception is delivered.
-+  uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
-+  EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
-+  CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
-+
-+  // The exception the stub's host trap would have raised (hlt: SIGILL, brk: SIGTRAP, a null load: SIGSEGV).
-+  // HandleGuestException keeps this code for execute faults, so it must match the trap.
-+  EXCEPTION_RECORD HostRec {};
-+  if (Fault.Signal == FEXCore::Core::FAULT_SIGILL) {
-+    HostRec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
-+  } else if (Fault.Signal == FEXCore::Core::FAULT_SIGTRAP) {
-+    HostRec.ExceptionCode = EXCEPTION_BREAKPOINT;
-+  } else {
-+    HostRec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
-+  }
-+  BOOL FirstChance = TRUE;
-+  EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, HostRec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
-+  if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
-+    GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
-+  } else if (GuestRec.ExceptionCode == EXCEPTION_BREAKPOINT) {
-+    GuestContext.Pc -= 1;
-+  }
-+  __atomic_fetch_add(&FastTrapStats.Taken, 1, __ATOMIC_RELAXED);
-+  FastRaiseOrNative(GuestRec, GuestContext, FirstChance);
-+  __builtin_unreachable();
-+}
-+
- static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& Context) {
-   auto* Thread = GetCPUArea().ThreadState();
+ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& GuestContext) {
    auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
-@@ -598,7 +703,15 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+ 
+@@ -674,7 +723,11 @@ static void RaiseException(FEXCore::Core::InternalThreadState* Thread, const EXC
      GuestContext.Pc -= 1;
    }
  
@@ -829,14 +716,10 @@ index ab908b0fa..3e7744cce 100644
 +  // not see the first-chance event; the old path stays as the fallback when the guest stack cannot take the frame.
 +  // FEX_EXP_FASTRAISE=0 turns it off.
 +  FastRaiseTo(GuestRec, GuestContext, FirstChance);
-+}
-+
-+static void FastRaiseOrNative(EXCEPTION_RECORD& GuestRec, ARM64_NT_CONTEXT& GuestContext, BOOL FirstChance) {
-+  FastRaiseTo(GuestRec, GuestContext, FirstChance);
  }
  
- // A NoExec stub is compiled when a block entry is not executable at compile time. If another thread makes the page
-@@ -758,6 +871,197 @@ public:
+ static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT& HostContext) {
+@@ -900,6 +953,197 @@ public:
  };
  } // namespace Exception
  
@@ -1034,7 +917,7 @@ index ab908b0fa..3e7744cce 100644
  extern "C" void SyncThreadContext(CONTEXT* Context) {
    ProcessPendingCrossProcessEmulatorWork();
    auto* Thread = GetCPUArea().ThreadState();
-@@ -836,6 +1140,30 @@ NTSTATUS ProcessInit() {
+@@ -978,6 +1222,30 @@ NTSTATUS ProcessInit() {
                                                            PAGE_EXECUTE_READ);
    *reinterpret_cast<uint8_t*>(X64ReturnInstr) = 0xc3;
  
@@ -1065,14 +948,6 @@ index ab908b0fa..3e7744cce 100644
    const uintptr_t KiUserExceptionDispatcherFFS = reinterpret_cast<uintptr_t>(GetProcAddress(NtDll, "KiUserExceptionDispatcher"));
    Exception::KiUserExceptionDispatcher = NtDllRedirectionLUT[KiUserExceptionDispatcherFFS - NtDllBase] + NtDllBase;
  
-@@ -1199,6 +1527,7 @@ NTSTATUS ThreadInit() {
- 
-   FEX::Windows::CallRetStack::InitializeThread(Thread);
-   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
-+  Thread->CurrentFrame->Pointers.GuestSignalTrapNative = Exception::FastTrapEnabled ? reinterpret_cast<uintptr_t>(&Exception::FastTrapEntry) : 0;
-   CPUArea.StateFrame() = Thread->CurrentFrame;
- 
-   uint64_t EnterEC = Thread->CurrentFrame->Pointers.DispatcherLoopTopEnterEC;
 diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
 index b9cfb25ff..304f29e8e 100644
 --- a/Source/Windows/Common/InvalidationTracker.cpp

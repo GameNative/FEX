@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <dalal.utkarsh@gmail.com>
+Date: Wed, 28 Oct 2026 18:27:57 +0530
+Subject: [PATCH] FEXOfflineCompiler: load the config before initializing
+ logging on Windows
+
+FEX::Windows::Logging::Init reads SilentLog and OutputLog from the
+config layers. The offline compiler initialized logging before any
+config was loaded, so all log output was dropped regardless of the
+user configuration.
+---
+ Source/Tools/FEXOfflineCompiler/Main.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/Source/Tools/FEXOfflineCompiler/Main.cpp b/Source/Tools/FEXOfflineCompiler/Main.cpp
+index e28a295d0..0cbb97cea 100644
+--- a/Source/Tools/FEXOfflineCompiler/Main.cpp
++++ b/Source/Tools/FEXOfflineCompiler/Main.cpp
+@@ -844,6 +844,10 @@ int main(int argc, char** argv) {
+   LogMan::Throw::InstallHandler(AssertHandler);
+   LogMan::Msg::InstallHandler(MsgHandler);
+ #else
++  {
++    char* envp[] = {nullptr};
++    FEX::Config::LoadConfig("", envp, FEX::ReadPortabilityInformation());
++  }
+   FEX::Windows::Logging::Init();
+ #endif
+ 
