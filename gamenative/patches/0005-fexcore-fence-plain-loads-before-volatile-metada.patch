@@ -24,7 +24,7 @@ same code under Rosetta runs clean.
  2 files changed, 19 insertions(+)
 
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
-index b0b4ad35b..5c79b2460 100644
+index 3c6101205..65c21f887 100644
 --- a/FEXCore/Source/Interface/Core/Core.cpp
 +++ b/FEXCore/Source/Interface/Core/Core.cpp
 @@ -669,6 +669,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
@@ -37,10 +37,10 @@ index b0b4ad35b..5c79b2460 100644
        Thread->OpDispatcher->SetNewBlockIfChanged(Block.Entry);
  
 diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
-index 85919f294..d973a24c8 100644
+index 03c584d3e..ae44ecd40 100644
 --- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
 +++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
-@@ -332,6 +332,9 @@ public:
+@@ -337,6 +337,9 @@ public:
    ForceTSOMode GetForceTSO() const {
      return ForceTSO;
    }
@@ -50,7 +50,7 @@ index 85919f294..d973a24c8 100644
  
    void SetDumpIR(bool DumpIR) {
      ShouldDump = DumpIR;
-@@ -1362,6 +1365,7 @@ private:
+@@ -1393,6 +1396,7 @@ private:
    bool DecodeFailure {false};
    bool NeedsBlockEnd {false};
    ForceTSOMode ForceTSO {ForceTSOMode::NoOverride};
@@ -58,7 +58,7 @@ index 85919f294..d973a24c8 100644
    // Used during new op bringup
    bool ShouldDump {false};
  
-@@ -2482,6 +2486,16 @@ private:
+@@ -2578,6 +2582,16 @@ private:
    bool IsMonoBackpatcherBlock {false};
    IROp_IRHeader* CurrentHeader {};
  
@@ -75,7 +75,7 @@ index 85919f294..d973a24c8 100644
    [[nodiscard]]
    bool IsTSOEnabled(RegClass Class) const {
      if (ForceTSO == ForceTSOMode::ForceEnabled) {
-@@ -2510,6 +2524,7 @@ private:
+@@ -2606,6 +2620,7 @@ private:
    }
  
    Ref _LoadMemAutoTSO(RegClass Class, OpSize Size, Ref ssa0, OpSize Align = OpSize::i8Bit) {
@@ -83,7 +83,7 @@ index 85919f294..d973a24c8 100644
      if (IsTSOEnabled(Class)) {
        return _LoadMemTSO(Class, Size, ssa0, Invalid(), Align, MemOffsetType::SXTX, 1);
      } else {
-@@ -2525,6 +2540,7 @@ private:
+@@ -2621,6 +2636,7 @@ private:
  
    Ref _LoadMemAutoTSO(RegClass Class, OpSize Size, const AddressMode& A, OpSize Align = OpSize::i8Bit) {
      const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
@@ -91,7 +91,7 @@ index 85919f294..d973a24c8 100644
      const auto B = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, AtomicTSO, Class != RegClass::GPR, Size);
  
      if (AtomicTSO) {
-@@ -2570,6 +2586,7 @@ private:
+@@ -2666,6 +2682,7 @@ private:
  
      // Use ldp if possible, otherwise fallback on two loads.
      if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {

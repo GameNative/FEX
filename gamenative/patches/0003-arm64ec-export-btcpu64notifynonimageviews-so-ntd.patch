@@ -26,10 +26,10 @@ index d57603079..67f351139 100644
  void STDMETHODCALLTYPE FlushInstructionCacheHeavy(const void* Address, SIZE_T Size);
  void STDMETHODCALLTYPE BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size);
 diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
-index 56379dcb3..a221b737f 100644
+index 8914f2c35..1fcea15d2 100644
 --- a/Source/Windows/ARM64EC/Module.cpp
 +++ b/Source/Windows/ARM64EC/Module.cpp
-@@ -1365,6 +1365,10 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After,
+@@ -1519,6 +1519,10 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After,
    }
  }
  
