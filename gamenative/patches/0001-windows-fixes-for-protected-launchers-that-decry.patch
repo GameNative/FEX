@@ -19,19 +19,25 @@ op carries the first byte that could not be fetched), so the VirtualQuery heuris
 HandleGuestException is gone. FEX-2611 also delivers JIT-raised guest faults on arm64ec straight
 to SynchronousExceptionHandler (27cfd41bf, 07abec317), so the stale NoExec retry runs there too
 (DropStaleNoExecFault + EnterDispatcherFillSRA), not only on the host exception path.
+
+Later d2r/clean fix for Battle.net launchers (2d8b53d393): SynchronousExceptionHandler sets
+InSyscallCallback around the stale NoExec retry and clears it before re-entering the dispatcher
+or raising. The fault stub reaches it with the flag clear, so the lookup cache decommit in the
+invalidation went to NotifyMemoryFree, which took the code invalidation mutex a second time on
+the same thread and hung the process.
 ---
  FEXCore/Source/Interface/Core/Core.cpp        |  34 +++
  FEXCore/Source/Interface/Core/DiskCache.cpp   |  10 +-
  .../Interface/Core/Dispatcher/Dispatcher.cpp  |   9 +
  FEXCore/Source/Interface/Core/Frontend.cpp    |   5 +
- .../Interface/Core/OpcodeDispatcher.cpp       |  72 ++++---
+ .../Interface/Core/OpcodeDispatcher.cpp       |  72 +++---
  .../Source/Interface/Core/OpcodeDispatcher.h  |   2 +
  .../FEXCore/Debug/InternalThreadState.h       |  13 ++
  Source/Windows/ARM64EC/Module.S               |   9 +
- Source/Windows/ARM64EC/Module.cpp             | 204 +++++++++++++++++-
+ Source/Windows/ARM64EC/Module.cpp             | 211 +++++++++++++++++-
  Source/Windows/Common/Exception.h             |   8 +-
  Source/Windows/Common/InvalidationTracker.cpp | 119 +++++++++-
- 11 files changed, 439 insertions(+), 46 deletions(-)
+ 11 files changed, 446 insertions(+), 46 deletions(-)
 
 diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
 index 2ba56b69a..53d81a872 100644
@@ -369,7 +375,7 @@ index ce36c1d68..4d9fd8b7e 100644
 +  mov x11, #0 // ENTRY_FILL_SRA_SINGLE_INST_REG: normal block
 +  br x1
 diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
-index 3be7e465a..4b8149bf3 100644
+index 3be7e465a..2af511082 100644
 --- a/Source/Windows/ARM64EC/Module.cpp
 +++ b/Source/Windows/ARM64EC/Module.cpp
 @@ -50,6 +50,7 @@ $end_info$
@@ -455,7 +461,7 @@ index 3be7e465a..4b8149bf3 100644
  
    ECContext.Fpcr = FPCR;
    ECContext.Fpsr = FPSR;
-@@ -657,12 +688,125 @@ static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, co
+@@ -657,12 +688,132 @@ static void RethrowGuestException(FEXCore::Core::InternalThreadState* Thread, co
    RaiseException(Thread, Rec, GuestContext);
  }
  
@@ -573,15 +579,22 @@ index 3be7e465a..4b8149bf3 100644
    auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
  
 +  // Stale NoExec faults never reach the host exception handler on this path, so drop them here and resume at RIP.
-+  if (DropStaleNoExecFault(Thread)) {
-+    const auto CPUArea = GetCPUArea();
++  // The fault stub branches here from JIT code with InSyscallCallback clear. Set it like the dispatcher's guarded
++  // calls and the host exception path do: the invalidation decommits lookup cache pages with the code invalidation
++  // mutex held, and without the flag ntdll reports that to NotifyMemoryFree, which takes the mutex again and hangs.
++  // Clear it again before either exit, since both run guest-visible code: the JIT, or the guest exception dispatch.
++  const auto CPUArea = GetCPUArea();
++  CPUArea.Area->InSyscallCallback = true;
++  const bool StaleNoExec = DropStaleNoExecFault(Thread);
++  CPUArea.Area->InSyscallCallback = false;
++  if (StaleNoExec) {
 +    EnterDispatcherFillSRA(CPUArea.Area, CPUArea.DispatcherLoopTopEnterECFillSRA(), CPUArea.EmulatorStackBase());
 +  }
 +
    uint64_t FPCR, FPSR;
    __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
    __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
-@@ -730,7 +874,24 @@ public:
+@@ -730,7 +881,24 @@ public:
    }
  
    FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
@@ -607,7 +620,7 @@ index 3be7e465a..4b8149bf3 100644
    }
  
    void PreCompile() override {
-@@ -744,9 +905,13 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
+@@ -744,9 +912,13 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
    auto* Thread = GetCPUArea().ThreadState();
    // All other EFlags bits are lost when converting to/from an ARM64EC context, so merge them in from the current JIT state.
    // This is advisable over dropping their values as thread suspend/resume uses this function, and that can happen at any point in guest code.
@@ -624,7 +637,7 @@ index 3be7e465a..4b8149bf3 100644
  
    uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
    Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
-@@ -777,6 +942,7 @@ NTSTATUS ProcessInit() {
+@@ -777,6 +949,7 @@ NTSTATUS ProcessInit() {
  
    const auto NtDll = GetModuleHandleW(L"ntdll.dll");
    const bool IsWine = !!GetProcAddress(NtDll, "wine_get_version");
@@ -632,7 +645,7 @@ index 3be7e465a..4b8149bf3 100644
    OvercommitTracker.emplace(IsWine);
  
    FEX::Windows::SetupEnvironmentVariableValues(NtDll);
-@@ -876,6 +1042,13 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+@@ -876,6 +1049,13 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
        return true;
      }
  
@@ -646,7 +659,7 @@ index 3be7e465a..4b8149bf3 100644
      std::scoped_lock Lock(ThreadCreationMutex);
      if (InvalidationTracker && InvalidationTracker->HandleRWXAccessViolation(Thread, NativeContext->Pc, FaultAddress)) {
        FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
-@@ -919,6 +1092,10 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+@@ -919,6 +1099,10 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
      return true;
    }
  
@@ -657,7 +670,7 @@ index 3be7e465a..4b8149bf3 100644
    if (IsEmulatorStackAddress(CPUArea, reinterpret_cast<uint64_t>(__builtin_frame_address(0)))) {
      Exception::RethrowGuestException(Thread, *Exception, *NativeContext);
      LogMan::Msg::DFmt("Rethrowing onto guest stack: {:X}", NativeContext->Sp);
-@@ -1081,7 +1258,18 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
+@@ -1081,7 +1265,18 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
  
    {
      std::scoped_lock Lock(ThreadCreationMutex);
