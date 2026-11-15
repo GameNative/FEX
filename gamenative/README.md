@@ -33,6 +33,7 @@ behaviour that is not a plain correctness fix is behind an env var.
 | 0010 wow64-handle-exceptions-raised-before-the-first-thread | GameNative | The WoW64 exception handler read the thread state without a null check; a fault during `BTCpuProcessInit` (cache validation) killed the process silently. The overcommit path now runs before any thread access | to be sent upstream |
 | 0011 codecache-keep-the-main-dispatcher-config-when-creating-the-validation-context | GameNative | The validation context's `InitCore` overwrote the shared signal handler config | to be sent upstream |
 | 0012 windows-log-the-code-cache-load-phases-and-pre-thread-exceptions | GameNative | INFO lines for each phase of an offline cache load (map, copy, relocate, register, finalize, enable), visible with `FEX_SILENTLOG=0` | GameNative only |
+| 0013 arm64ec-skip-the-fpcr-write-in-exitfunctionec-when-nep-and-ah-are-already-clear | GameNative | `ExitFunctionEC` wrote FPCR on every exit to native code; it now tests NEP and AH and skips the write when both are clear, which they always are without AFP. The write was 11% of process cycles in A Hat in Time on an 8 Elite with AFP disabled | to be sent upstream |
 
 Left out of 0002 on purpose: tarikbc 0002 (hides the emulator from the guest), 0007 (rewrites
 ntdll export bytes to pass one game's hook check), 0008 (debug tool), 0010 (obsolete on Proton

@@ -1,0 +1,41 @@
+From c83bff089f2bf706a74198e9963695a33d1318a5 Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <utkarsh@gamenative.app>
+Date: Mon, 16 Nov 2026 05:05:42 +0530
+Subject: [PATCH] ARM64EC: skip the FPCR write in ExitFunctionEC when NEP and
+ AH are already clear
+
+ExitFunctionEC runs on every exit from emulated x86 code to native ARM64EC
+code and wrote FPCR unconditionally. An FPCR write stalls the pipeline, and on
+games that call into native code often it dominates the thread: A Hat in Time
+(UE3) on a Snapdragon 8 Elite spent 11% of all process cycles on this one msr,
+with AFP disabled through FEX_HOSTFEATURES=disableafp (with AFP enabled the
+dispatcher's matching write on entry added another 16%).
+
+Without AFP, NEP and AH are never set, so the write never changes anything.
+Test the two bits first and only write when one of them is set.
+---
+ Source/Windows/ARM64EC/Module.S | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 0ceed511b..a6def4269 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -56,9 +56,14 @@ BeginSimulation:
+ .global ExitFunctionEC
+ ExitFunctionEC:
+   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
++  // An FPCR write stalls the pipeline and this runs on every exit to native code, so skip it
++  // when the bits are already clear: always the case when AFP is unsupported or disabled.
+   mrs x17, fpcr
++  tst x17, #6 // NEP + AH
++  b.eq exit_fpcr_clear
+   and x17, x17, #~6 // NEP + AH
+   msr fpcr, x17
++exit_fpcr_clear:
+   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
+   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+   ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
+-- 
+2.43.0
+
