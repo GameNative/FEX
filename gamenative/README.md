@@ -33,6 +33,7 @@ behaviour that is not a plain correctness fix is behind an env var.
 | 0010 wow64-handle-exceptions-raised-before-the-first-thread | GameNative | The WoW64 exception handler read the thread state without a null check; a fault during `BTCpuProcessInit` (cache validation) killed the process silently. The overcommit path now runs before any thread access | to be sent upstream |
 | 0011 codecache-keep-the-main-dispatcher-config-when-creating-the-validation-context | GameNative | The validation context's `InitCore` overwrote the shared signal handler config | to be sent upstream |
 | 0012 windows-log-the-code-cache-load-phases-and-pre-thread-exceptions | GameNative | INFO lines for each phase of an offline cache load (map, copy, relocate, register, finalize, enable), visible with `FEX_SILENTLOG=0` | GameNative only |
+| 0013 arm64ec-process-cross-process-work-inside-a-syscall-callback | GameNative | Cross-process work (memory-write, alloc/free/protect and flush entries) is applied with the thread marked as inside a syscall callback. The invalidation it triggers holds `CodeInvalidationMutex` while the allocator frees memory; outside a callback ntdll reported that free back to `NotifyMemoryFree`, which locked the mutex again on the same thread and hung | to be sent upstream |
 
 Left out of 0002 on purpose: tarikbc 0002 (hides the emulator from the guest), 0007 (rewrites
 ntdll export bytes to pass one game's hook check), 0008 (debug tool), 0010 (obsolete on Proton
