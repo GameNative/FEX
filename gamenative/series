@@ -11,3 +11,4 @@
 0011-codecache-keep-the-main-dispatcher-config-when-c.patch
 0012-windows-log-the-code-cache-load-phases-and-pre-t.patch
 0013-arm64ec-skip-the-fpcr-write-in-exitfunctionec-when-n.patch
+0014-arm64ec-set-fpcr-nep-and-ah-lazily-in-the-jit-blocks-that-n.patch
