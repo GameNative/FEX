@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <utkarsh@gamenative.app>
+Date: Mon, 16 Nov 2026 07:35:30 +0530
+Subject: [PATCH] ARM64EC: set FPCR.NEP/AH lazily in the JIT blocks that need
+ them
+
+On FEAT_AFP hosts the ARM64EC entry from native code set FPCR.NEP and AH on every return into JIT code,
+and ExitFunctionEC cleared them on every exit. An FPCR write that changes a bit costs about 8 ns on an
+8 Elite (Oryon) against ~0 for a read, and the pair took about 27% of process cycles in A Hat in Time.
+
+The bits only change floating-point arithmetic, compares and conversions; loads, stores, moves (fmov,
+ins), integer SIMD, crypto and fcsel behave the same either way (checked on an 8 Elite). So:
+
+- The IR generator gives every op a UsesHostFPMode property. It fails closed: VectorScalar, F64, F80
+  and unknown classes count, as do VF* vector ops, FP conversions, FP compares and the rounding-mode ops
+  (they save and restore the whole FPCR).
+- The JIT emits a guard at the head of every IR block containing such an op: mrs FPCR, tbnz NEP, and
+  only if clear, orr NEP|AH and msr. Every entry into a block passes there, including call-ret returns.
+  It doesn't touch NZCV.
+- The ARM64EC entry no longer sets NEP/AH. FEX_EXP_EAGERAFP=1 sets them there again; blocks carry
+  their guards in both modes.
+- SpillStaticRegs skips its FPCR write when NEP, AH and FIZ are already clear, without touching NZCV.
+- The disk cache format version goes to 43, since codegen changed.
+
+Code reached without FP ops between a return from native code and the next call out now makes no
+FPCR write at all. Results are unchanged: every FP op still runs with the AFP bits set.
+---
+ FEXCore/Scripts/json_ir_generator.py          | 35 +++++++++++++++++++
+ .../Core/ArchHelpers/Arm64Emitter.cpp         | 26 +++++++++++++-
+ .../Interface/Core/ArchHelpers/Arm64Emitter.h |  9 +++++
+ FEXCore/Source/Interface/Core/DiskCache.h     |  2 +-
+ .../Interface/Core/Dispatcher/Dispatcher.cpp  | 11 +++++-
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp     | 14 ++++++++
+ 6 files changed, 94 insertions(+), 3 deletions(-)
+
+diff --git a/FEXCore/Scripts/json_ir_generator.py b/FEXCore/Scripts/json_ir_generator.py
+index 4678ddd86..859092afb 100755
+--- a/FEXCore/Scripts/json_ir_generator.py
++++ b/FEXCore/Scripts/json_ir_generator.py
+@@ -58,6 +58,7 @@ class OpDefinition:
+     JITDispatch: bool
+     JITDispatchOverride: str
+     TiedSource: int
++    UsesHostFPMode: bool
+     Inline: list[str]
+     Arguments: list[OpArgument]
+     EmitValidation: list[str]
+@@ -83,6 +84,7 @@ class OpDefinition:
+         self.JITDispatch = True
+         self.JITDispatchOverride = None
+         self.TiedSource = -1
++        self.UsesHostFPMode = True
+         self.Arguments = []
+         self.EmitValidation = []
+         self.Desc = []
+@@ -106,6 +108,33 @@ def parse_irtypes(irtypes):
+         IRTypesToCXX[op_key] = IRType(op_key, op_val)
+         CXXTypeToIR[op_val] = IRType(op_key, op_val)
+ 
++# Whether the op's host code may contain a floating-point instruction whose result depends on the
++# FPCR.AH/NEP/FIZ mode bits (FEAT_AFP). Measured on an 8 Elite: those bits change FP arithmetic,
++# FP compares and FP conversions only; loads, stores, moves (including fmov and ins), integer SIMD,
++# crypto and fcsel behave the same either way. The JIT sets the AFP bits at the head of any block
++# that contains such an op, so this fails closed: anything not known to be FP-free counts.
++FPModeFreeClasses = {"Misc", "Moves", "StaticRA", "Memory", "Atomic", "Branch", "Backend", "Crypto", "ALU", "Vector", "Conv"}
++FPModeOps = {
++    # Misc: these read or write the whole FPCR, so they must see the AFP bits already set.
++    "GetRoundingMode", "SetRoundingMode", "PushRoundingMode", "PopRoundingMode",
++    # ALU: FP compares and conversions to GPRs.
++    "Select", "Float_ToGPR_S", "Float_ToGPR_ZS", "FCmp",
++}
++FPModeFreeConvOps = {"VCastFromGPR", "VDupFromGPR", "VLoadTwoGPRs"}
++
++def UsesHostFPMode(OpDef):
++    if OpDef.OpClass not in FPModeFreeClasses:
++        # VectorScalar, F64, F80 and anything new.
++        return True
++    if OpDef.Name in FPModeOps:
++        return True
++    if OpDef.OpClass == "Vector":
++        # Every FP vector op is named VF*: VFAdd, VFCMPEQ, VFMLA, VFRecp, ...
++        return OpDef.Name.startswith("VF")
++    if OpDef.OpClass == "Conv":
++        return OpDef.Name not in FPModeFreeConvOps
++    return False
++
+ def parse_ops(ops):
+     for op_class, opslist in ops.items():
+         for op, op_val in opslist.items():
+@@ -275,6 +304,10 @@ def parse_ops(ops):
+             if "TiedSource" in op_val:
+                 OpDef.TiedSource = op_val["TiedSource"]
+ 
++            OpDef.UsesHostFPMode = UsesHostFPMode(OpDef)
++            if "UsesHostFPMode" in op_val:
++                OpDef.UsesHostFPMode = bool(op_val["UsesHostFPMode"])
++
+             # Pad Inline out to the argument count
+             OpDef.Inline = [''] * len(OpDef.Arguments)
+             if "Inline" in op_val:
+@@ -417,6 +450,7 @@ def print_ir_sizes():
+     [[nodiscard, gnu::const]] bool GetHasDest(IROps Op);
+     [[nodiscard, gnu::const]] bool LoweredX87(IROps Op);
+     [[nodiscard, gnu::const]] int8_t TiedSource(IROps Op);
++    [[nodiscard, gnu::const]] bool UsesHostFPMode(IROps Op);
+ 
+     #undef IROP_SIZES
+     #endif
+@@ -514,6 +548,7 @@ def print_ir_hassideeffects():
+         ("ImplicitFlagClobber", "bool"),
+         ("LoweredX87", "bool"),
+         ("TiedSource", "int8_t"),
++        ("UsesHostFPMode", "bool"),
+     ]:
+         output_file.write(
+             f"constexpr std::array<{'uint8_t' if T == 'bool' else T}, OP_LAST + 1> {prop}_ = {{\n"
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index 3ebadb5aa..cb0972ae0 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -636,7 +636,7 @@ void Arm64Emitter::PopCalleeSavedRegisters() {
+ 
+ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options) {
+ #ifndef VIXL_SIMULATOR
+-  if (EmitterCTX->HostFeatures.SupportsAFP) {
++  if (EmitterCTX->HostFeatures.SupportsAFP && Options.SetAFP) {
+     // Enable AFP features when filling JIT state.
+     mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
+ 
+@@ -678,6 +678,22 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
+   }
+ }
+ 
++void Arm64Emitter::EmitAFPModeGuard(ARMEmitter::Register TmpReg) {
++#ifndef VIXL_SIMULATOR
++  if (EmitterCTX->HostFeatures.SupportsAFP) {
++    // NEP and AH are always set and cleared together, so NEP alone says which mode FPCR is in.
++    ARMEmitter::ForwardLabel l_AFPSet;
++    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
++    (void)tbnz(TmpReg, 2, &l_AFPSet);
++    orr(ARMEmitter::Size::i64Bit, TmpReg, TmpReg,
++        (1U << 2) |   // NEP
++          (1U << 1)); // AH
++    msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
++    (void)Bind(&l_AFPSet);
++  }
++#endif
++}
++
+ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOptions Options) {
+ #ifndef VIXL_SIMULATOR
+   if (EmitterCTX->HostFeatures.SupportsAFP) {
+@@ -690,12 +706,20 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
+     //
+     // Additional interesting AFP bits:
+     // FIZ(0): Flush Inputs to Zero
++    //
++    // Skip the write when the bits are already clear: since the ARM64EC entry stopped setting NEP and AH,
++    // FP-free code often reaches here without them. Without touching NZCV, which is saved below.
++    ARMEmitter::ForwardLabel l_AFPClear;
++    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
++    and_(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0b111);
++    (void)cbz(ARMEmitter::Size::i64Bit, TmpReg, &l_AFPClear);
+     mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
+     bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg,
+         (1U << 2) |   // NEP
+           (1U << 1) | // AH
+           (1U << 0)); // FIZ
+     msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
++    (void)Bind(&l_AFPClear);
+   }
+ #endif
+ 
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+index 5ad6e7b19..670ce3ab1 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+@@ -142,9 +142,18 @@ protected:
+     // with certain canned values that accelerate some operations. Will (obviously)
+     // not load predicates, even if set to true, on host systems that do not support SVE.
+     bool SetPredRegs {};
++
++    // Whether to set FPCR.NEP and FPCR.AH on FEAT_AFP hosts. The ARM64EC entry from native code leaves
++    // them clear and the JIT sets them at the head of any block that uses them (EmitAFPModeGuard), so
++    // a call out to native code that returns into FP-free guest code costs no FPCR write.
++    bool SetAFP {true};
+   };
+   void FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options);
+ 
++  // Sets FPCR.NEP and FPCR.AH if they are not set yet. Only reads FPCR when they are, which is free;
++  // an FPCR write that changes a bit costs about 8 ns on an 8 Elite. Doesn't touch NZCV.
++  void EmitAFPModeGuard(ARMEmitter::Register TmpReg);
++
+   // Correlate an ARM register back to an x86 register index.
+   // Returning REG_INVALID if there was no mapping.
+   FEXCore::X86State::X86Reg GetX86RegRelationToARMReg(ARMEmitter::Register Reg);
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index f65319e12..4899cd250 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -249,7 +249,7 @@ namespace DiskCache {
+   // The current version of the diskcache.
+   // This must be changed any time codegen changes occur!
+   // Be aware of the impact of changing this frequently!
+-  static constexpr uint16_t FormatVersion = 42;
++  static constexpr uint16_t FormatVersion = 43;
+ 
+   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;
+ 
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 6ed397b4f..79a9c31cf 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -20,6 +20,8 @@
+ 
+ #include <CodeEmitter/Emitter.h>
+ 
++#include <cstdlib>
++
+ #ifdef VIXL_SIMULATOR
+ #include <aarch64/simulator-aarch64.h>
+ #endif
+@@ -121,7 +123,14 @@ void Dispatcher::EmitDispatcher() {
+ 
+   ldr(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+ 
+-  FillSpecialRegs(TMP1, TMP2, {.SetFIZ = false, .SetPredRegs = true});
++  // Leave FPCR.NEP/AH for the JIT blocks that need them to set (EmitAFPModeGuard), rather than paying for an
++  // FPCR write on every return from native code and another on the next exit. FEX_EXP_EAGERAFP=1 restores the
++  // write here; blocks carry their guards either way, so compiled and cached code is valid in both modes.
++  static const bool EagerAFP = [] {
++    const char* Value = getenv("FEX_EXP_EAGERAFP");
++    return Value && Value[0] == '1';
++  }();
++  FillSpecialRegs(TMP1, TMP2, {.SetFIZ = false, .SetPredRegs = true, .SetAFP = EagerAFP});
+ 
+   // As ARM64EC uses this as an entrypoint for both guest calls and host returns, opportunistically try to return
+   // using the call-ret stack to avoid unbalancing it.
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index d5d5b13be..d2a293aef 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -993,6 +993,20 @@ CPUBackend::CompiledCode Arm64JITCore::EmitJITCode(uint64_t Entry, uint64_t Size
+       BindOrRestart(Target);
+     }
+ 
++    // Every way into this block passes Target: dispatcher lookups and block links enter at the entry point,
++    // returns through the call-ret stack land on the return block's entry point, and jumps inside the
++    // multiblock branch to Target. The ARM64EC entry from native code leaves FPCR.NEP/AH clear, so set them
++    // here if this block has an op whose host code depends on them. Calls out of JIT code in the middle
++    // of a block restore them when they come back (FillStaticRegs).
++    if (HostSupportsAFP) {
++      for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
++        if (IR::UsesHostFPMode(IROp->Op)) {
++          EmitAFPModeGuard(TMP1);
++          break;
++        }
++      }
++    }
++
+     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+       switch (IROp->Op) {
+ #define REGISTER_OP(op, x) \
