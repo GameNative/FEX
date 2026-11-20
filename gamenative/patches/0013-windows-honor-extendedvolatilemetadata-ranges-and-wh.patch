@@ -1,0 +1,340 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <utkarsh.dalal@toptal.com>
+Date: Fri, 20 Nov 2026 16:06:54 +0530
+Subject: [PATCH] Windows: honor ExtendedVolatileMetadata ranges and
+ whole-module entries
+
+Since FEX-2608 a block is relaxed by volatile metadata only when a listed
+instruction lies inside it. That is right for PE volatile metadata, where
+the listed instructions are what the compiler marked, but it leaves a
+FEX_EXTENDEDVOLATILEMETADATA range or whole-module entry without effect:
+those entries list no instructions.
+
+Keep the ranges that come from the option in their own list. A block that
+lies entirely inside one is translated without TSO for its integer loads
+and stores; listed instructions and the Unity displacement accesses keep
+TSO, and plain loads before them are fenced as in PE metadata blocks. A
+block that crosses a range boundary keeps TSO. Modules that only carry PE
+volatile metadata behave as before. The Linux frontend is unchanged.
+
+An entry can name a module by its image ID,
+`<lowercase file name>-<XXH3 of the name ^ (SizeOfImage << 32 | TimeDateStamp)>`,
+which upstream already accepts as a key. Such an entry applies only to the
+build it was written for. When another build of that module loads, the
+entry is ignored and one info line names both IDs, so a game update that
+ships a different DLL under the same name keeps full TSO.
+---
+ .../Source/Interface/Config/Config.json.in    | 10 ++-
+ FEXCore/Source/Interface/Context/Context.h    |  3 +
+ FEXCore/Source/Interface/Core/Core.cpp        | 20 +++++-
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  5 +-
+ FEXCore/include/FEXCore/Core/Context.h        | 10 +++
+ Source/Common/VolatileMetadata.h              | 32 +++++++++
+ Source/Windows/Common/ImageTracker.cpp        | 19 ++++++
+ .../APITests/ExtendedVolatileMetadata.cpp     | 68 +++++++++++++++++++
+ 8 files changed, 164 insertions(+), 3 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Config/Config.json.in b/FEXCore/Source/Interface/Config/Config.json.in
+index 602b2a50d..a6451085b 100644
+--- a/FEXCore/Source/Interface/Config/Config.json.in
++++ b/FEXCore/Source/Interface/Config/Config.json.in
+@@ -751,7 +751,15 @@
+           "  * Disable TSO for a part of the module, but enable TSO for some instructions within the module",
+           "      `hl2_linux;<offset begin>-<offset-end>;<instruction offset>,<instruction offset>`",
+           "  * Disable TSO for multiple modules",
+-          "      `hl2_linux:libsdl2.so`"
++          "      `hl2_linux:libsdl2.so`",
++          "On WoW64/arm64ec a range or whole-module entry takes effect on its own: a block that lies entirely inside it",
++          "is translated without TSO for integer loads and stores, except listed instructions. A block that crosses",
++          "a range boundary keeps TSO. Ranges are end exclusive.",
++          "On WoW64/arm64ec a module can also be named by its image ID, `<lowercase file name>-<16 hex digits>`,",
++          "the XXH3-64 hash of the lowercase file name XOR (SizeOfImage << 32 | TimeDateStamp), as printed in the",
++          "`Load module` log line. Such an entry applies only to that build of the module; another build of it",
++          "is left alone and logged.",
++          "      `unityplayer.dll-5695747efd732d16;1000-2000`"
+         ]
+       }
+     }
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index d8834c6ef..d8a0b1b51 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -247,6 +247,8 @@ public:
+ 
+   void AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) override;
+ 
++  void AddTSODisabledRanges(const IntervalList<uint64_t>& Ranges) override;
++
+   void RemoveForceTSOInformation(uint64_t Address, uint64_t Size) override;
+ 
+   void MarkMonoDetected() override {
+@@ -518,6 +520,7 @@ private:
+   fextl::unordered_map<uint64_t, CustomIRHandlerEntry> CustomIRHandlers;
+   IntervalList<uint64_t> ForceTSOValidRanges; // The ranges for which ForceTSOInstructions has populated data
+   fextl::set<uint64_t> ForceTSOInstructions;
++  IntervalList<uint64_t> TSODisabledRanges; // Configured ranges that need no TSO, with no per-instruction data
+ 
+   bool MonoDetected = false;
+   std::atomic<uint64_t> MonoBackpatcherBlock;
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 65c21f887..6aa88d9d1 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -661,6 +661,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+ #endif
+ 
+       bool BlockInForceTSOValidRange = false;
++      bool BlockInTSODisabledRange = false;
+       auto InstForceTSOIt = ForceTSOInstructions.end();
+       if (ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
+         if (auto It = ForceTSOInstructions.lower_bound(Block.Entry); It != ForceTSOInstructions.end() && *It < Block.Entry + Block.Size) {
+@@ -668,8 +669,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           BlockInForceTSOValidRange = true;
+         }
+       }
++      if (!BlockInForceTSOValidRange && TSODisabledRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
++        InstForceTSOIt = ForceTSOInstructions.lower_bound(Block.Entry);
++        BlockInTSODisabledRange = true;
++      }
+ 
+-      Thread->OpDispatcher->ResetMetadataLoadOrder(BlockInForceTSOValidRange);
++      Thread->OpDispatcher->ResetMetadataLoadOrder(BlockInForceTSOValidRange || BlockInTSODisabledRange);
+ 
+       // Set the block entry point
+       Thread->OpDispatcher->SetNewBlockIfChanged(Block.Entry);
+@@ -767,6 +772,13 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+             } else {
+               ForceTSO = IR::ForceTSOMode::ForceDisabled;
+             }
++          } else if (BlockInTSODisabledRange) {
++            if ((InstForceTSOIt != ForceTSOInstructions.end() && *InstForceTSOIt == InstAddress) ||
++                (DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO)) {
++              ForceTSO = IR::ForceTSOMode::ForceEnabled;
++            } else {
++              ForceTSO = IR::ForceTSOMode::ForceDisabledGPR;
++            }
+           } else if (DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) {
+             ForceTSO = IR::ForceTSOMode::ForceEnabled;
+           }
+@@ -1507,10 +1519,16 @@ void ContextImpl::AddForceTSOInformation(const IntervalList<uint64_t>& ValidRang
+   ForceTSOInstructions.merge(std::move(Instructions));
+ }
+ 
++void ContextImpl::AddTSODisabledRanges(const IntervalList<uint64_t>& Ranges) {
++  LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
++  TSODisabledRanges.Insert(Ranges);
++}
++
+ void ContextImpl::RemoveForceTSOInformation(uint64_t Address, uint64_t Size) {
+   LogMan::Throw::AFmt(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+ 
+   ForceTSOValidRanges.Remove({Address, Address + Size});
++  TSODisabledRanges.Remove({Address, Address + Size});
+   ForceTSOInstructions.erase(ForceTSOInstructions.lower_bound(Address), ForceTSOInstructions.upper_bound(Address + Size));
+ }
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index ae44ecd40..5d4c828d4 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -85,6 +85,7 @@ enum class BTAction {
+ enum class ForceTSOMode {
+   NoOverride,
+   ForceDisabled,
++  ForceDisabledGPR,
+   ForceEnabled,
+ };
+ 
+@@ -2585,7 +2586,7 @@ private:
+   // x86 keeps loads in program order: a metadata-forced TSO load must not let earlier plain loads complete after it.
+   void OrderMetadataLoad(bool AtomicTSO) {
+     if (!AtomicTSO) {
+-      MetadataPlainLoadPending |= ForceTSO == ForceTSOMode::ForceDisabled;
++      MetadataPlainLoadPending |= ForceTSO == ForceTSOMode::ForceDisabled || ForceTSO == ForceTSOMode::ForceDisabledGPR;
+     } else if (ForceTSO == ForceTSOMode::ForceEnabled && MetadataPlainLoadPending) {
+       _Fence(FenceType::Load);
+       MetadataPlainLoadPending = false;
+@@ -2598,6 +2599,8 @@ private:
+       return true;
+     } else if (ForceTSO == ForceTSOMode::ForceDisabled) {
+       return false;
++    } else if (ForceTSO == ForceTSOMode::ForceDisabledGPR && Class == RegClass::GPR) {
++      return false;
+     } else if (Class == RegClass::FPR) {
+       return CTX->IsVectorAtomicTSOEnabled();
+     } else {
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index 3524bcede..178463463 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -195,6 +195,16 @@ public:
+    */
+   FEX_DEFAULT_VISIBILITY virtual void AddForceTSOInformation(const IntervalList<uint64_t>& ValidRanges, fextl::set<uint64_t>&& Instructions) = 0;
+ 
++  /**
++   * @brief Adds address ranges whose integer loads and stores need no TSO emulation, without per-instruction information.
++   *
++   * A block that lies entirely inside these ranges is translated without TSO for its integer accesses, except for
++   * instructions listed through AddForceTSOInformation. A block that crosses a range boundary keeps TSO.
++   *
++   * @param Ranges The address ranges, end exclusive
++   */
++  FEX_DEFAULT_VISIBILITY virtual void AddTSODisabledRanges(const IntervalList<uint64_t>& Ranges) = 0;
++
+   FEX_DEFAULT_VISIBILITY virtual void RemoveForceTSOInformation(uint64_t Address, uint64_t Size) = 0;
+ 
+   FEX_DEFAULT_VISIBILITY virtual void MarkMonoDetected() = 0;
+diff --git a/Source/Common/VolatileMetadata.h b/Source/Common/VolatileMetadata.h
+index a6141fe1b..b9a0e95d2 100644
+--- a/Source/Common/VolatileMetadata.h
++++ b/Source/Common/VolatileMetadata.h
+@@ -6,6 +6,8 @@
+ #include <FEXCore/fextl/set.h>
+ #include <FEXCore/fextl/string.h>
+ 
++#include <algorithm>
++#include <cctype>
+ #include <string_view>
+ 
+ namespace FEX::VolatileMetadata {
+@@ -48,4 +50,34 @@ inline void ApplyFEXExtendedVolatileMetadata(FEX::VolatileMetadata::ExtendedVola
+   }
+ }
+ 
++// Option ranges and whole-module entries need no listed instruction to take effect, so they are kept apart from PE volatile metadata.
++inline void ApplyFEXExtendedTSODisabledRanges(const FEX::VolatileMetadata::ExtendedVolatileMetadata& ExtendedMetaData,
++                                              FEXCore::IntervalList<uint64_t>& TSODisabledRanges, uint64_t Address, uint64_t EndAddress) {
++  if (ExtendedMetaData.ModuleTSODisabled) {
++    TSODisabledRanges.Insert({Address, EndAddress});
++    return;
++  }
++
++  for (const auto it_ranges : ExtendedMetaData.VolatileValidRanges) {
++    if (it_ranges.Offset < it_ranges.End && it_ranges.End <= EndAddress - Address) {
++      TSODisabledRanges.Insert({Address + it_ranges.Offset, Address + it_ranges.End});
++    } else {
++      LogMan::Msg::IFmt("ExtendedVolatileMetadata: range 0x{:x}-0x{:x} does not fit in the module [0x{:x}, 0x{:x}), ignored", it_ranges.Offset,
++                        it_ranges.End, Address, EndAddress);
++    }
++  }
++}
++
++// An entry keyed by image ID (`<lowercase module name>-<16 hex digits>`, see CodeMap::GetBaseFilename) for the module whose
++// ID is ImageId, but naming another build of it: a different TimeDateStamp or SizeOfImage.
++inline bool IsOtherImageIdOfModule(std::string_view Key, std::string_view ImageId) {
++  constexpr size_t HashDigits = 16;
++  if (ImageId.size() <= HashDigits + 1 || Key.size() != ImageId.size() || Key == ImageId) {
++    return false;
++  }
++  const auto NamePrefix = ImageId.substr(0, ImageId.size() - HashDigits);
++  return Key.starts_with(NamePrefix) &&
++         std::ranges::all_of(Key.substr(NamePrefix.size()), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; });
++}
++
+ } // namespace FEX::VolatileMetadata
+diff --git a/Source/Windows/Common/ImageTracker.cpp b/Source/Windows/Common/ImageTracker.cpp
+index fbe74eef2..82f52e13f 100644
+--- a/Source/Windows/Common/ImageTracker.cpp
++++ b/Source/Windows/Common/ImageTracker.cpp
+@@ -151,6 +151,25 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
+   auto ID = FEXCore::CodeMap::GetBaseFilename(ImageInfo->Info, false);
+   LogMan::Msg::DFmt("Load module {} ({}): {:X}", ModuleName, ID, Address);
+ 
++  if (FEXCore::Config::Get_VOLATILEMETADATA()) {
++    const uint64_t EndAddress = Address + Nt->OptionalHeader.SizeOfImage;
++    FEXCore::IntervalList<uint64_t> TSODisabledRanges {};
++    for (const auto& Key : {ID, ModuleName}) {
++      if (auto It = ExtendedMetaData.find(Key); It != ExtendedMetaData.end()) {
++        FEX::VolatileMetadata::ApplyFEXExtendedTSODisabledRanges(It->second, TSODisabledRanges, Address, EndAddress);
++        LogMan::Msg::IFmt("ExtendedVolatileMetadata: applied {} to {} at {:X}", Key, ModuleName, Address);
++      }
++    }
++    for (const auto& [Key, Entry] : ExtendedMetaData) {
++      if (FEX::VolatileMetadata::IsOtherImageIdOfModule(Key, ID)) {
++        LogMan::Msg::IFmt("ExtendedVolatileMetadata: ignored {}, the loaded {} is {}", Key, ModuleName, ID);
++      }
++    }
++    if (!TSODisabledRanges.Empty()) {
++      CTX.AddTSODisabledRanges(TSODisabledRanges);
++    }
++  }
++
+   if (FEXCore::Config::Get_ENABLECODECACHINGWIP() && !IsGeneratingCache) {
+     if (MainImage) {
+       LARGE_INTEGER Time;
+diff --git a/unittests/APITests/ExtendedVolatileMetadata.cpp b/unittests/APITests/ExtendedVolatileMetadata.cpp
+index 4c0654828..42b940984 100644
+--- a/unittests/APITests/ExtendedVolatileMetadata.cpp
++++ b/unittests/APITests/ExtendedVolatileMetadata.cpp
+@@ -156,3 +156,71 @@ TEST_CASE("Basic - Double - offset") {
+     }
+   }
+ }
++
++TEST_CASE("Image ID - Key") {
++  const auto String = "unityplayer.dll-5695747efd732d16;1000-2000,3000-3100";
++  const auto Result = FEX::VolatileMetadata::ParseExtendedVolatileMetadata(String);
++  REQUIRE(Result.size() == 1);
++  REQUIRE(Result.contains("unityplayer.dll-5695747efd732d16"));
++  CHECK(Result.at("unityplayer.dll-5695747efd732d16").ModuleTSODisabled == false);
++  CHECK(Result.at("unityplayer.dll-5695747efd732d16").VolatileInstructions.empty());
++
++  const std::vector<std::pair<uint64_t, uint64_t>> ValidRanges = {
++    {0x1000, 0x2000},
++    {0x3000, 0x3100},
++  };
++
++  size_t Count = 0;
++  for (auto it : Result.at("unityplayer.dll-5695747efd732d16").VolatileValidRanges) {
++    CHECK(ContainsRange(std::make_pair(it.Offset, it.End), ValidRanges));
++    ++Count;
++  }
++  CHECK(Count == ValidRanges.size());
++}
++
++TEST_CASE("Image ID - Other build of the module") {
++  const std::string_view Loaded = "unityplayer.dll-5695747efd732d16";
++  CHECK(FEX::VolatileMetadata::IsOtherImageIdOfModule("unityplayer.dll-0123456789abcdef", Loaded));
++  CHECK_FALSE(FEX::VolatileMetadata::IsOtherImageIdOfModule(Loaded, Loaded));
++  CHECK_FALSE(FEX::VolatileMetadata::IsOtherImageIdOfModule("unityplayer.dll", Loaded));
++  CHECK_FALSE(FEX::VolatileMetadata::IsOtherImageIdOfModule("gameassembly.dll-0123456789abcdef", Loaded));
++  CHECK_FALSE(FEX::VolatileMetadata::IsOtherImageIdOfModule("unityplayer.dll-0123456789abcdeg", Loaded));
++  CHECK_FALSE(FEX::VolatileMetadata::IsOtherImageIdOfModule("unityplayer.dll-0123456789abcde", Loaded));
++}
++
++TEST_CASE("TSO disabled ranges - offsets") {
++  const auto Result = FEX::VolatileMetadata::ParseExtendedVolatileMetadata("UnityPlayer.dll;1000-1800,3000-3010,1fff0-20010");
++  FEXCore::IntervalList<uint64_t> Ranges {};
++  FEX::VolatileMetadata::ApplyFEXExtendedTSODisabledRanges(Result.at("UnityPlayer.dll"), Ranges, 0x7ff800000000, 0x7ff800020000);
++
++  CHECK(Ranges.Contains({0x7ff800001000, 0x7ff800001800}));
++  CHECK(Ranges.Contains({0x7ff800003000, 0x7ff800003010}));
++  // A block crossing a range boundary is not covered.
++  CHECK_FALSE(Ranges.Contains({0x7ff8000017f0, 0x7ff800001810}));
++  CHECK_FALSE(Ranges.Contains({0x7ff800000ff0, 0x7ff800001010}));
++  CHECK_FALSE(Ranges.Contains({0x7ff800002000, 0x7ff800002010}));
++  // A range past the end of the module is dropped.
++  CHECK_FALSE(Ranges.Intersect({0x7ff80001fff0, 0x7ff800020000}));
++}
++
++TEST_CASE("TSO disabled ranges - whole module") {
++  const auto Result = FEX::VolatileMetadata::ParseExtendedVolatileMetadata("UnityPlayer.dll");
++  FEXCore::IntervalList<uint64_t> Ranges {};
++  FEX::VolatileMetadata::ApplyFEXExtendedTSODisabledRanges(Result.at("UnityPlayer.dll"), Ranges, 0x180000000, 0x181e65000);
++
++  CHECK(Ranges.Contains({0x180000000, 0x181e65000}));
++  CHECK_FALSE(Ranges.Contains({0x181e64ff0, 0x181e65010}));
++}
++
++TEST_CASE("TSO disabled ranges - instructions keep their PE metadata form") {
++  auto Result = FEX::VolatileMetadata::ParseExtendedVolatileMetadata("UnityPlayer.dll;1000-2000;1010");
++  fextl::set<uint64_t> Instructions {};
++  FEXCore::IntervalList<uint64_t> ValidRanges {};
++  FEXCore::IntervalList<uint64_t> Ranges {};
++  FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(Result.at("UnityPlayer.dll"), Instructions, ValidRanges, 0x10000, 0x20000);
++  FEX::VolatileMetadata::ApplyFEXExtendedTSODisabledRanges(Result.at("UnityPlayer.dll"), Ranges, 0x10000, 0x20000);
++
++  CHECK(Instructions.contains(0x11010));
++  CHECK(ValidRanges.Contains({0x11000, 0x12000}));
++  CHECK(Ranges.Contains({0x11000, 0x12000}));
++}
