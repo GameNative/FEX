@@ -30,9 +30,9 @@ ships a different DLL under the same name keeps full TSO.
  .../Source/Interface/Core/OpcodeDispatcher.h  |  5 +-
  FEXCore/include/FEXCore/Core/Context.h        | 10 +++
  Source/Common/VolatileMetadata.h              | 32 +++++++++
- Source/Windows/Common/ImageTracker.cpp        | 18 +++--
+ Source/Windows/Common/ImageTracker.cpp        | 19 ++++++
  .../APITests/ExtendedVolatileMetadata.cpp     | 68 +++++++++++++++++++
- 8 files changed, 159 insertions(+), 7 deletions(-)
+ 8 files changed, 164 insertions(+), 3 deletions(-)
 
 diff --git a/FEXCore/Source/Interface/Config/Config.json.in b/FEXCore/Source/Interface/Config/Config.json.in
 index 602b2a50d..4dab2e570 100644
@@ -233,42 +233,35 @@ index a6141fe1b..b9a0e95d2 100644
 +
  } // namespace FEX::VolatileMetadata
 diff --git a/Source/Windows/Common/ImageTracker.cpp b/Source/Windows/Common/ImageTracker.cpp
-index fbe74eef2..f960cb921 100644
+index fbe74eef2..82f52e13f 100644
 --- a/Source/Windows/Common/ImageTracker.cpp
 +++ b/Source/Windows/Common/ImageTracker.cpp
-@@ -185,18 +185,28 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
-   uint64_t EndAddress = Address + Nt->OptionalHeader.SizeOfImage;
-   fextl::set<uint64_t> VolatileInstructions {};
-   FEXCore::IntervalList<uint64_t> VolatileValidRanges {};
-+  FEXCore::IntervalList<uint64_t> TSODisabledRanges {};
-   LoadImageVolatileMetadata(VolatileInstructions, VolatileValidRanges, Module, Nt, Address, EndAddress);
--  if (auto It = ExtendedMetaData.find(ID); It != ExtendedMetaData.end()) {
--    FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address, EndAddress);
-+  for (const auto& Key : {ID, ModuleName}) {
-+    if (auto It = ExtendedMetaData.find(Key); It != ExtendedMetaData.end()) {
-+      FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address, EndAddress);
-+      FEX::VolatileMetadata::ApplyFEXExtendedTSODisabledRanges(It->second, TSODisabledRanges, Address, EndAddress);
-+      LogMan::Msg::IFmt("ExtendedVolatileMetadata: applied {} to {} at {:X}", Key, ModuleName, Address);
-+    }
-   }
--  if (auto It = ExtendedMetaData.find(fextl::string {ModuleName}); It != ExtendedMetaData.end()) {
--    FEX::VolatileMetadata::ApplyFEXExtendedVolatileMetadata(It->second, VolatileInstructions, VolatileValidRanges, Address, EndAddress);
-+  for (const auto& [Key, Entry] : ExtendedMetaData) {
-+    if (FEX::VolatileMetadata::IsOtherImageIdOfModule(Key, ID)) {
-+      LogMan::Msg::IFmt("ExtendedVolatileMetadata: ignored {}, the loaded {} is {}", Key, ModuleName, ID);
-+    }
-   }
+@@ -151,6 +151,25 @@ FEXCore::ExecutableFileSectionInfo ImageTracker::HandleImageMap(std::string_view
+   auto ID = FEXCore::CodeMap::GetBaseFilename(ImageInfo->Info, false);
+   LogMan::Msg::DFmt("Load module {} ({}): {:X}", ModuleName, ID, Address);
  
-   if (!VolatileInstructions.empty() || !VolatileValidRanges.Empty()) {
-     LogMan::Msg::DFmt("Loaded volatile metadata for {:X}: {} entries", Address, VolatileInstructions.size());
-     CTX.AddForceTSOInformation(VolatileValidRanges, std::move(VolatileInstructions));
-   }
-+  if (!TSODisabledRanges.Empty()) {
-+    CTX.AddTSODisabledRanges(TSODisabledRanges);
++  if (FEXCore::Config::Get_VOLATILEMETADATA()) {
++    const uint64_t EndAddress = Address + Nt->OptionalHeader.SizeOfImage;
++    FEXCore::IntervalList<uint64_t> TSODisabledRanges {};
++    for (const auto& Key : {ID, ModuleName}) {
++      if (auto It = ExtendedMetaData.find(Key); It != ExtendedMetaData.end()) {
++        FEX::VolatileMetadata::ApplyFEXExtendedTSODisabledRanges(It->second, TSODisabledRanges, Address, EndAddress);
++        LogMan::Msg::IFmt("ExtendedVolatileMetadata: applied {} to {} at {:X}", Key, ModuleName, Address);
++      }
++    }
++    for (const auto& [Key, Entry] : ExtendedMetaData) {
++      if (FEX::VolatileMetadata::IsOtherImageIdOfModule(Key, ID)) {
++        LogMan::Msg::IFmt("ExtendedVolatileMetadata: ignored {}, the loaded {} is {}", Key, ModuleName, ID);
++      }
++    }
++    if (!TSODisabledRanges.Empty()) {
++      CTX.AddTSODisabledRanges(TSODisabledRanges);
++    }
 +  }
- 
-   return ImageInfo->SectionInfo;
- }
++
+   if (FEXCore::Config::Get_ENABLECODECACHINGWIP() && !IsGeneratingCache) {
+     if (MainImage) {
+       LARGE_INTEGER Time;
 diff --git a/unittests/APITests/ExtendedVolatileMetadata.cpp b/unittests/APITests/ExtendedVolatileMetadata.cpp
 index 4c0654828..e2bea22ee 100644
 --- a/unittests/APITests/ExtendedVolatileMetadata.cpp
