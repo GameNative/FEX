@@ -35,7 +35,7 @@ ships a different DLL under the same name keeps full TSO.
  8 files changed, 164 insertions(+), 3 deletions(-)
 
 diff --git a/FEXCore/Source/Interface/Config/Config.json.in b/FEXCore/Source/Interface/Config/Config.json.in
-index 602b2a50d..4dab2e570 100644
+index 602b2a50d..a6451085b 100644
 --- a/FEXCore/Source/Interface/Config/Config.json.in
 +++ b/FEXCore/Source/Interface/Config/Config.json.in
 @@ -751,7 +751,15 @@
@@ -51,7 +51,7 @@ index 602b2a50d..4dab2e570 100644
 +          "the XXH3-64 hash of the lowercase file name XOR (SizeOfImage << 32 | TimeDateStamp), as printed in the",
 +          "`Load module` log line. Such an entry applies only to that build of the module; another build of it",
 +          "is left alone and logged.",
-+          "      `unityplayer.dll-5695747efd732d16;11b4360-11b4d35`"
++          "      `unityplayer.dll-5695747efd732d16;1000-2000`"
          ]
        }
      }
@@ -263,7 +263,7 @@ index fbe74eef2..82f52e13f 100644
      if (MainImage) {
        LARGE_INTEGER Time;
 diff --git a/unittests/APITests/ExtendedVolatileMetadata.cpp b/unittests/APITests/ExtendedVolatileMetadata.cpp
-index 4c0654828..e2bea22ee 100644
+index 4c0654828..42b940984 100644
 --- a/unittests/APITests/ExtendedVolatileMetadata.cpp
 +++ b/unittests/APITests/ExtendedVolatileMetadata.cpp
 @@ -156,3 +156,71 @@ TEST_CASE("Basic - Double - offset") {
@@ -272,7 +272,7 @@ index 4c0654828..e2bea22ee 100644
  }
 +
 +TEST_CASE("Image ID - Key") {
-+  const auto String = "unityplayer.dll-5695747efd732d16;11b4360-11b4d35,11bfc20-11bfc93";
++  const auto String = "unityplayer.dll-5695747efd732d16;1000-2000,3000-3100";
 +  const auto Result = FEX::VolatileMetadata::ParseExtendedVolatileMetadata(String);
 +  REQUIRE(Result.size() == 1);
 +  REQUIRE(Result.contains("unityplayer.dll-5695747efd732d16"));
@@ -280,8 +280,8 @@ index 4c0654828..e2bea22ee 100644
 +  CHECK(Result.at("unityplayer.dll-5695747efd732d16").VolatileInstructions.empty());
 +
 +  const std::vector<std::pair<uint64_t, uint64_t>> ValidRanges = {
-+    {0x11b4360, 0x11b4d35},
-+    {0x11bfc20, 0x11bfc93},
++    {0x1000, 0x2000},
++    {0x3000, 0x3100},
 +  };
 +
 +  size_t Count = 0;
