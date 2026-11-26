@@ -1,0 +1,532 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Utkarsh Dalal <utkarsh.dalal@toptal.com>
+Date: Thu, 26 Nov 2026 16:45:04 +0530
+Subject: [PATCH] CodeMap: record indirect jump and call targets
+
+With CodeMapIndirectBranches, an indirect jump or call whose target misses
+the thread's L1 lookup cache leaves its guest RIP in the frame; the
+dispatcher checks it against a per-thread table of seen pairs and, for a
+new pair, appends a {site, target} record (marker 0xffffffdd, 36 bytes)
+to the code map. Returns are not recorded. Nothing changes on the L1 hit
+path or with the option off.
+
+CodeMapIndirectResampleMS drops a slice of each thread's L1 at that
+interval (an eighth of it in the first two minutes) so pairs whose target
+was already cached are seen as well.
+
+ParseCodeMap skips the new record.
+---
+ .../Source/Interface/Config/Config.json.in    | 19 +++++
+ FEXCore/Source/Interface/Context/Context.h    | 18 +++++
+ FEXCore/Source/Interface/Core/CodeCache.cpp   | 45 ++++++++++--
+ FEXCore/Source/Interface/Core/Core.cpp        | 71 +++++++++++++++++++
+ .../Interface/Core/Dispatcher/Dispatcher.cpp  | 54 ++++++++++++++
+ .../Source/Interface/Core/JIT/BranchOps.cpp   |  4 ++
+ FEXCore/Source/Interface/Core/LookupCache.h   | 13 ++++
+ .../Interface/Core/OpcodeDispatcher.cpp       | 19 ++---
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  4 +-
+ FEXCore/Source/Interface/IR/IR.json           |  5 +-
+ FEXCore/include/FEXCore/Core/CodeCache.h      | 14 ++++
+ FEXCore/include/FEXCore/Core/CoreState.h      |  8 +++
+ .../FEXCore/Debug/InternalThreadState.h       |  3 +
+ 13 files changed, 259 insertions(+), 18 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Config/Config.json.in b/FEXCore/Source/Interface/Config/Config.json.in
+index a6451085b..2ef0836b9 100644
+--- a/FEXCore/Source/Interface/Config/Config.json.in
++++ b/FEXCore/Source/Interface/Config/Config.json.in
+@@ -26,6 +26,25 @@
+           "Enable the code caching subsystem"
+         ]
+       },
++      "CodeMapIndirectBranches": {
++        "Type": "bool",
++        "Default": "false",
++        "AffectsCodeGen": "true",
++        "Desc": [
++          "Record the targets of indirect jumps and calls in code maps",
++          "A {site, target} pair is recorded when the target misses the thread's L1 lookup cache"
++        ]
++      },
++      "CodeMapIndirectResampleMS": {
++        "Type": "uint32",
++        "Default": "500",
++        "AffectsCodeGen": "false",
++        "Desc": [
++          "With CodeMapIndirectBranches: milliseconds between invalidating a slice of each thread's L1",
++          "lookup cache so pairs whose target was already cached get recorded too",
++          "One eighth of this during the first two minutes. 0 disables it"
++        ]
++      },
+       "EnableLazyCodeCachingWIP": {
+         "Type": "bool",
+         "Default": "false",
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index d8a0b1b51..23e165aa2 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -21,6 +21,7 @@
+ #include <FEXCore/fextl/vector.h>
+ 
+ #include <atomic>
++#include <bit>
+ #include <cstddef>
+ #include <cstdint>
+ #include <mutex>
+@@ -359,6 +360,8 @@ public:
+     bool NeedsPendingInterruptFaultCheck {false};
+ 
+     FEX_CONFIG_OPT(Multiblock, MULTIBLOCK);
++    FEX_CONFIG_OPT(CodeMapIndirectBranches, CODEMAPINDIRECTBRANCHES);
++    FEX_CONFIG_OPT(CodeMapIndirectResampleMS, CODEMAPINDIRECTRESAMPLEMS);
+     FEX_CONFIG_OPT(SingleStepConfig, SINGLESTEP);
+     FEX_CONFIG_OPT(GdbServer, GDBSERVER);
+     FEX_CONFIG_OPT(Is64BitMode, IS64BIT_MODE);
+@@ -438,6 +441,21 @@ public:
+   uintptr_t CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst = 0);
+   uintptr_t CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
+ 
++  // Code map indirect branch sampling, called from the dispatcher (CodeMapIndirectBranches).
++  static constexpr uint64_t IndirectBranchSeenEntries = 2048;
++  static constexpr uint64_t IndirectBranchSampleDispatches = 16384;
++  static constexpr size_t IndirectResampleSliceEntries = 4096;
++  static constexpr size_t MaxIndirectBranchPairs = 1 << 20;
++  static uint64_t IndirectBranchSeenIndex(uint64_t Site, uint64_t Target) {
++    return (Site ^ std::rotr(Target, 7)) & (IndirectBranchSeenEntries - 1);
++  }
++  static uint64_t SampleIndirectBranch(FEXCore::Core::CpuStateFrame* Frame);
++  void RecordIndirectBranch(FEXCore::Core::InternalThreadState* Thread, uint64_t Site, uint64_t Target);
++  void ResampleIndirectBranches(FEXCore::Core::InternalThreadState* Thread);
++  std::mutex IndirectBranchPairsMutex;
++  fextl::set<std::pair<uint64_t, uint64_t>> IndirectBranchPairs;
++  uint64_t IndirectSampleStartMS {};
++
+   FEXCore::JITSymbols Symbols;
+ 
+   FEXCore::Utils::PooledAllocatorVirtual OpDispatcherAllocator {"FEXMem_OpDispatcher"};
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+index 1fbaa12c9..d4c1dd908 100644
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -121,6 +121,12 @@ fextl::map<CodeMapFileId, CodeMap::ParsedContents> CodeMap::ParseCodeMap(std::if
+       }
+       Ret[ExecutableFileId].ExecutableBitness =
+         (Entry.FileId == SetExecutableFileId::Marker32.FileId && Entry.BlockOffset == SetExecutableFileId::Marker32.BlockOffset) ? 32 : 64;
++    } else if (Entry.FileId == IndirectBranch::Marker.FileId && Entry.BlockOffset == IndirectBranch::Marker.BlockOffset) {
++      char Pair[sizeof(IndirectBranch) - sizeof(CodeMap::Entry)];
++      File.read(Pair, sizeof(Pair));
++      if (!File) {
++        break;
++      }
+     } else {
+       if (!Ret.contains(Entry.FileId)) {
+         if (Entry.FileId == 0xffff'ffff'ffff'ffff) {
+@@ -199,26 +205,53 @@ void CodeMapWriter::AppendBlock(const FEXCore::ExecutableFileSectionInfo& Sectio
+     ERROR_AND_DIE_FMT("Cannot write code map");
+   }
+ 
++  RegisterFile(SectionInfo.FileInfo);
++
++  // Register the actual code block
++  CodeMap::Entry DataEntry {SectionInfo.FileInfo.FileId, static_cast<uint32_t>(BlockEntry)};
++  AppendData(std::as_bytes(std::span {&DataEntry, 1}));
++}
++
++void CodeMapWriter::RegisterFile(const FEXCore::ExecutableFileInfo& FileInfo) {
+   // Register new library if not already known
+   bool NewLibraryLoad = false;
+   {
+     // Check prior registration with shared lock
+     std::shared_lock Lock {Mutex};
+-    NewLibraryLoad = !KnownFileIds.contains(SectionInfo.FileInfo.FileId);
++    NewLibraryLoad = !KnownFileIds.contains(FileInfo.FileId);
+   }
+   if (NewLibraryLoad) {
+     // Register to map with exclusive lock
+     std::unique_lock Lock {Mutex};
+-    NewLibraryLoad &= KnownFileIds.insert(SectionInfo.FileInfo.FileId).second;
++    NewLibraryLoad &= KnownFileIds.insert(FileInfo.FileId).second;
+   }
+   if (NewLibraryLoad) {
+     // Add entry to code map
+-    AppendLibraryLoad(SectionInfo.FileInfo);
++    AppendLibraryLoad(FileInfo);
+   }
++}
+ 
+-  // Register the actual code block
+-  CodeMap::Entry DataEntry {SectionInfo.FileInfo.FileId, static_cast<uint32_t>(BlockEntry)};
+-  AppendData(std::as_bytes(std::span {&DataEntry, 1}));
++void CodeMapWriter::AppendIndirectBranch(const FEXCore::ExecutableFileSectionInfo& Site, uint64_t SiteRIP,
++                                         const FEXCore::ExecutableFileSectionInfo& Target, uint64_t TargetRIP) {
++  if (!IsWriteEnabled(Site) || !IsWriteEnabled(Target)) {
++    return;
++  }
++
++  SiteRIP -= Site.FileStartVA;
++  TargetRIP -= Target.FileStartVA;
++  if (SiteRIP > std::numeric_limits<uint32_t>::max() || TargetRIP > std::numeric_limits<uint32_t>::max()) {
++    return;
++  }
++
++  RegisterFile(Site.FileInfo);
++  RegisterFile(Target.FileInfo);
++
++  CodeMap::IndirectBranch Data {
++    CodeMap::IndirectBranch::Marker,
++    {Site.FileInfo.FileId, static_cast<uint32_t>(SiteRIP)},
++    {Target.FileInfo.FileId, static_cast<uint32_t>(TargetRIP)},
++  };
++  AppendData(std::span {reinterpret_cast<const std::byte*>(&Data), sizeof(Data)});
+ }
+ 
+ void CodeMapWriter::AppendLibraryLoad(const FEXCore::ExecutableFileInfo& FileInfo) {
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index b5aa4ac90..d5931ec7c 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -512,10 +512,81 @@ FEXCore::Core::InternalThreadState* ContextImpl::CreateThread(const FEXCore::Cor
+     Thread->SymbolBuffer = JITSymbols::AllocateBuffer();
+   }
+ 
++  if (Config.CodeMapIndirectBranches) {
++    Thread->CurrentFrame->IndirectBranchSeen =
++      static_cast<uint64_t*>(FEXCore::Allocator::calloc(IndirectBranchSeenEntries * 2, sizeof(uint64_t)));
++    Thread->CurrentFrame->IndirectBranchCountdown = IndirectBranchSampleDispatches;
++    Thread->CurrentFrame->IndirectBranchSite = 0;
++    auto NowMS = static_cast<uint64_t>(
++      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++    uint64_t Unset = 0;
++    __atomic_compare_exchange_n(&IndirectSampleStartMS, &Unset, NowMS, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
++    Thread->IndirectResampleLastMS = NowMS;
++  }
++
+   return Thread;
+ }
+ 
++uint64_t ContextImpl::SampleIndirectBranch(FEXCore::Core::CpuStateFrame* Frame) {
++  auto Thread = Frame->Thread;
++  auto CTX = static_cast<ContextImpl*>(Thread->CTX);
++  Frame->IndirectBranchCountdown = IndirectBranchSampleDispatches;
++
++  const uint64_t Site = Frame->IndirectBranchSite;
++  if (Site) {
++    Frame->IndirectBranchSite = 0;
++    const uint64_t Target = Frame->State.rip;
++    auto Slot = &Frame->IndirectBranchSeen[IndirectBranchSeenIndex(Site, Target) * 2];
++    Slot[0] = Site;
++    Slot[1] = Target;
++    if (CTX->CodeMapWriter) {
++      CTX->RecordIndirectBranch(Thread, Site, Target);
++    }
++  }
++
++  CTX->ResampleIndirectBranches(Thread);
++  return 0;
++}
++
++void ContextImpl::RecordIndirectBranch(FEXCore::Core::InternalThreadState* Thread, uint64_t Site, uint64_t Target) {
++  {
++    std::scoped_lock lk(IndirectBranchPairsMutex);
++    if (IndirectBranchPairs.size() >= MaxIndirectBranchPairs || !IndirectBranchPairs.emplace(Site, Target).second) {
++      return;
++    }
++  }
++
++  auto SiteSection = SyscallHandler->LookupExecutableFileSection(Thread, Site);
++  if (!SiteSection || SiteSection->FileStartVA == 0) {
++    return;
++  }
++  auto TargetSection = SyscallHandler->LookupExecutableFileSection(Thread, Target);
++  if (!TargetSection || TargetSection->FileStartVA == 0) {
++    return;
++  }
++  CodeMapWriter->AppendIndirectBranch(*SiteSection, Site, *TargetSection, Target);
++}
++
++void ContextImpl::ResampleIndirectBranches(FEXCore::Core::InternalThreadState* Thread) {
++  const uint64_t IntervalMS = Config.CodeMapIndirectResampleMS;
++  if (!IntervalMS) {
++    return;
++  }
++  const auto NowMS = static_cast<uint64_t>(
++    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
++  const bool Early = NowMS - __atomic_load_n(&IndirectSampleStartMS, __ATOMIC_RELAXED) < 120'000;
++  if (NowMS - Thread->IndirectResampleLastMS < (Early ? IntervalMS / 8 : IntervalMS)) {
++    return;
++  }
++  Thread->IndirectResampleLastMS = NowMS;
++  Thread->LookupCache->DropL1Slice(Thread->IndirectResampleCursor, IndirectResampleSliceEntries);
++}
++
+ void ContextImpl::DestroyThread(FEXCore::Core::InternalThreadState* Thread) {
++  if (Thread->CurrentFrame->IndirectBranchSeen) {
++    FEXCore::Allocator::free(Thread->CurrentFrame->IndirectBranchSeen);
++    Thread->CurrentFrame->IndirectBranchSeen = nullptr;
++  }
+   FEXCore::Allocator::VirtualProtect(&Thread->InterruptFaultPage, sizeof(Thread->InterruptFaultPage),
+                                      Allocator::ProtectOptions::Read | Allocator::ProtectOptions::Write);
+   delete Thread;
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 6ed397b4f..fda249c79 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -146,6 +146,22 @@ void Dispatcher::EmitDispatcher() {
+   // Load in our RIP
+   ldr(RipReg, STATE_PTR(CpuStateFrame, State.rip));
+ 
++  const bool SampleIndirectBranches = CTX->Config.CodeMapIndirectBranches;
++  ARMEmitter::ForwardLabel l_IndirectSite;
++  ARMEmitter::ForwardLabel l_IndirectSample;
++  ARMEmitter::ForwardLabel l_IndirectSampleHandler;
++  ARMEmitter::BiDirectionalLabel l_IndirectSiteDone;
++  if (SampleIndirectBranches) {
++    // An indirect jump or call that missed the L1 cache left its guest RIP here.
++    ldr(TMP1, STATE_PTR(CpuStateFrame, IndirectBranchSite));
++    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &l_IndirectSite);
++    (void)Bind(&l_IndirectSiteDone);
++    ldr(TMP1, STATE_PTR(CpuStateFrame, IndirectBranchCountdown));
++    sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, 1);
++    str(TMP1, STATE_PTR(CpuStateFrame, IndirectBranchCountdown));
++    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_IndirectSample);
++  }
++
+ #ifdef ARCHITECTURE_arm64ec
+   // Clobbers TMP1/2
+   // Check the EC code bitmap incase we need to exit the JIT to call into native code.
+@@ -348,6 +364,39 @@ void Dispatcher::EmitDispatcher() {
+     br(TMP1);
+   }
+ 
++  if (SampleIndirectBranches) {
++    // Pairs already in this thread's table skip the call. Flags are live, so compare with sub + cbnz.
++    (void)Bind(&l_IndirectSite);
++    ldr(TMP2, STATE_PTR(CpuStateFrame, IndirectBranchSeen));
++    eor(ARMEmitter::Size::i64Bit, TMP4, TMP1, RipReg, ARMEmitter::ShiftType::ROR, 7);
++    and_(ARMEmitter::Size::i64Bit, TMP4, TMP4, FEXCore::Context::ContextImpl::IndirectBranchSeenEntries - 1);
++    add(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4, ARMEmitter::ShiftType::LSL, 4);
++    ldr(TMP4, TMP2, 0);
++    sub(TMP4, TMP4, TMP1);
++    (void)cbnz(ARMEmitter::Size::i64Bit, TMP4, &l_IndirectSample);
++    ldr(TMP4, TMP2, 8);
++    sub(TMP4, TMP4, RipReg);
++    (void)cbnz(ARMEmitter::Size::i64Bit, TMP4, &l_IndirectSample);
++    str(ARMEmitter::XReg::zr, STATE_PTR(CpuStateFrame, IndirectBranchSite));
++    (void)b(&l_IndirectSiteDone);
++
++    (void)Bind(&l_IndirectSample);
++    EmitSignalGuardedRegion([&]() {
++      SpillStaticRegs(TMP1);
++
++      mov(ARMEmitter::XReg::x0, STATE);
++      ldr(ARMEmitter::XReg::x1, &l_IndirectSampleHandler);
++      if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
++        GenerateIndirectRuntimeCall<uint64_t, void*>(ARMEmitter::Reg::r1);
++      } else {
++        blr(ARMEmitter::Reg::r1);
++      }
++
++      FillStaticRegs();
++    });
++    (void)b(&LoopTop);
++  }
++
+   {
+     (void)Bind(&CompileSingleStep);
+ 
+@@ -661,6 +710,11 @@ void Dispatcher::EmitDispatcher() {
+   dc64(reinterpret_cast<uintptr_t>(CTX));
+   (void)Bind(&l_Sleep);
+   dc64(reinterpret_cast<uint64_t>(SleepThread));
++  if (SampleIndirectBranches) {
++    (void)Bind(&l_IndirectSampleHandler);
++    dc64(reinterpret_cast<uint64_t>(&FEXCore::Context::ContextImpl::SampleIndirectBranch));
++  }
++
+   (void)Bind(&l_CompileBlock);
+   FEXCore::Utils::MemberFunctionToPointerCast PMFCompileBlock(&FEXCore::Context::ContextImpl::CompileBlock);
+   dc64(PMFCompileBlock.GetConvertedPointer());
+diff --git a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+index c2b1d8e28..65b3e21e8 100644
+--- a/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/BranchOps.cpp
+@@ -217,6 +217,10 @@ DEF_OP(ExitFunction) {
+     (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+     ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+     str(RipReg.X(), STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
++    if (Op->IndirectSite && Op->Hint != IR::BranchHint::Return && CTX->Config.CodeMapIndirectBranches) {
++      InsertGuestRIPMove(TMP1, Op->IndirectSite);
++      str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, IndirectBranchSite));
++    }
+ 
+     (void)Bind(&SkipFullLookup);
+     if (Op->Hint == IR::BranchHint::Call) {
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index 391d48560..8a2d8d897 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -307,6 +307,19 @@ public:
+     CacheBlockMapping(Address, Entry, true, lk);
+   }
+ 
++  // Drops Count L1 entries starting at Cursor (wrapping at the current L1 size) and advances Cursor.
++  // Only called by the thread that owns this cache; empty entries are not written so unused pages stay untouched.
++  void DropL1Slice(uint64_t& Cursor, size_t Count) {
++    auto Entries = reinterpret_cast<LookupCacheEntry*>(L1Pointer);
++    for (size_t i = 0; i < Count; ++i) {
++      auto& Entry = Entries[(Cursor + i) & L1PointerMask];
++      if (Entry.GuestCode) {
++        Entry.GuestCode = 0;
++      }
++    }
++    Cursor += Count;
++  }
++
+   // Invalidates L1/L2 for a given guest block
+   void InvalidateCache(uint64_t Address, const LookupCacheWriteLockToken& lk) {
+     // Do L1
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 0807f46c0..42f4f2541 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -521,13 +521,16 @@ void OpDispatchBuilder::CALLAbsoluteOp(OpcodeArgs) {
+ 
+   // Store the RIP
+   const uint64_t NextRIP = Op->PC + Op->InstSize;
+-  ExitFunction(JMPPCOffset, BranchHint::Call, ConstantPC, [&]() {
+-    auto CallReturnJumpTarget = JumpTargets.find(NextRIP);
+-    if (CallReturnJumpTarget != JumpTargets.end() && CallReturnJumpTarget->second.IsEntryPoint) {
+-      return CallReturnJumpTarget->second.BlockEntry;
+-    }
+-    return InvalidNode;
+-  }());
++  ExitFunction(
++    JMPPCOffset, BranchHint::Call, ConstantPC,
++    [&]() {
++      auto CallReturnJumpTarget = JumpTargets.find(NextRIP);
++      if (CallReturnJumpTarget != JumpTargets.end() && CallReturnJumpTarget->second.IsEntryPoint) {
++        return CallReturnJumpTarget->second.BlockEntry;
++      }
++      return InvalidNode;
++    }(),
++    0, 0, Op->PC);
+ }
+ 
+ std::optional<CondClass> OpDispatchBuilder::DecodeNZCVCondition(uint8_t OP) {
+@@ -896,7 +899,7 @@ void OpDispatchBuilder::JUMPAbsoluteOp(OpcodeArgs) {
+   auto RIPOffset = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
+ 
+   // Store the new RIP
+-  ExitFunction(RIPOffset);
++  ExitFunction(RIPOffset, BranchHint::None, InvalidNode, InvalidNode, 0, 0, Op->PC);
+ }
+ 
+ void OpDispatchBuilder::JUMPFARIndirectOp(OpcodeArgs) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index a72131779..918ea073f 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -204,9 +204,9 @@ public:
+     return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, InvalidNode, InvalidNode);
+   }
+   IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint, Ref CallReturnAddress, Ref CallReturnBlock,
+-                                         uint64_t PatchSiteAddress = 0, uint64_t PatchSiteSize = 0) {
++                                         uint64_t PatchSiteAddress = 0, uint64_t PatchSiteSize = 0, uint64_t IndirectSite = 0) {
+     FlushRegisterCache();
+-    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize);
++    return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, CallReturnAddress, CallReturnBlock, PatchSiteAddress, PatchSiteSize, IndirectSite);
+   }
+   IRPair<IROp_Break> Break(BreakDefinition Reason, Ref RelocatedPC = nullptr) {
+     FlushRegisterCache();
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 16c29e759..648c7cf5e 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -313,8 +313,9 @@
+         "HasSideEffects": true,
+         "RAOverride": "2"
+       },
+-      "ExitFunction OpSize:#Size, GPR:$NewRIP, BranchHint:$Hint, GPR:$CallReturnAddress, SSA:$CallReturnBlock, i64:$PatchSiteAddress{0}, i64:$PatchSiteSize{0}": {
+-        "Desc": ["Exits the current JIT function with a target RIP - optionally patchable from guest bytes for caching"
++      "ExitFunction OpSize:#Size, GPR:$NewRIP, BranchHint:$Hint, GPR:$CallReturnAddress, SSA:$CallReturnBlock, i64:$PatchSiteAddress{0}, i64:$PatchSiteSize{0}, i64:$IndirectSite{0}": {
++        "Desc": ["Exits the current JIT function with a target RIP - optionally patchable from guest bytes for caching",
++                 "IndirectSite is the guest RIP of the indirect jump or call, for code map sampling"
+                 ],
+         "Inline": ["Any"],
+         "HasSideEffects": true,
+diff --git a/FEXCore/include/FEXCore/Core/CodeCache.h b/FEXCore/include/FEXCore/Core/CodeCache.h
+index a09c574fe..391dfc7e0 100644
+--- a/FEXCore/include/FEXCore/Core/CodeCache.h
++++ b/FEXCore/include/FEXCore/Core/CodeCache.h
+@@ -110,6 +110,16 @@ struct CodeMap {
+     CodeMapFileId ExecutableFileId;
+   };
+ 
++  // Target of an indirect jump or call, recorded once per {site, target} pair. Site is the offset of the
++  // jump or call instruction in its file; both files are introduced by LoadExternalLibrary entries first.
++  struct FEX_PACKED IndirectBranch {
++    static constexpr Entry Marker = {0xffff'ffff'ffff'ffff, 0xffff'ffdd};
++    Entry RecordMarker;
++    Entry Site;
++    Entry Target;
++  };
++  static_assert(sizeof(IndirectBranch) == 36);
++
+   struct ParsedContents {
+     fextl::string Filename;
+     fextl::set<uint64_t> Blocks;
+@@ -157,11 +167,15 @@ public:
+   void AppendBlock(const FEXCore::ExecutableFileSectionInfo&, uint64_t Entry);
+   void AppendLibraryLoad(const FEXCore::ExecutableFileInfo&);
+   void AppendSetMainExecutable(const FEXCore::ExecutableFileInfo&, bool Is64Bit);
++  void AppendIndirectBranch(const FEXCore::ExecutableFileSectionInfo& Site, uint64_t SiteRIP,
++                            const FEXCore::ExecutableFileSectionInfo& Target, uint64_t TargetRIP);
+ 
+   // Thread-safely commit any pending data to disk
+   void Flush(size_t Offset);
+ 
+ private:
++  void RegisterFile(const FEXCore::ExecutableFileInfo&);
++
+   // Queues data into an internal ring buffer.
+   // Call Flush() to commit the data to disk.
+   void AppendData(std::span<const std::byte> Data);
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index c1cb5f03c..b8ba7fb4b 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -472,12 +472,20 @@ struct CpuStateFrame {
+ 
+   // Pointers that the JIT needs to load to remove relocations
+   JITPointers Pointers;
++
++  // Code map indirect branch sampling (CodeMapIndirectBranches): guest RIP of the indirect branch whose
++  // target missed the L1 cache, dispatcher passes left until the next sampling call, and the per-thread
++  // table of {site, target} pairs already reported.
++  uint64_t IndirectBranchSite {};
++  uint64_t IndirectBranchCountdown {};
++  uint64_t* IndirectBranchSeen {};
+ };
+ static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
+ static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
+ static_assert(offsetof(CpuStateFrame, Pointers) + sizeof(CpuStateFrame::Pointers) <= 32760, "JITPointers maximum pointer needs to be less "
+                                                                                             "than architecture maximum 32768");
+ 
++static_assert(offsetof(CpuStateFrame, IndirectBranchSeen) <= 32760, "Indirect branch sampling fields need an ldr immediate offset");
+ static_assert(std::is_standard_layout<CpuStateFrame>::value, "This needs to be standard layout");
+ static_assert(sizeof(CpuStateFrame::SynchronousFaultData) == 16, "This needs to be 16 bytes");
+ static_assert(alignof(CpuStateFrame::SynchronousFaultDataStruct) == 8, "This needs to be 8 bytes");
+diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+index 935c7cb73..cb8f69da2 100644
+--- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
++++ b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+@@ -118,6 +118,9 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
+   uint64_t VolatileEntryRIP {};
+   // Hash of the guest bytes of the last decoded compile unit (see ContextImpl::TryReuseBlock).
+   uint64_t ReuseDecodeHash {};
++  // Code map indirect branch sampling (see ContextImpl::SampleIndirectBranch).
++  uint64_t IndirectResampleLastMS {};
++  uint64_t IndirectResampleCursor {};
+ 
+   uintptr_t JITGuardPage {};
+   uint64_t JITGuardOverflowArgument {};

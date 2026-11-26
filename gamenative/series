@@ -11,3 +11,4 @@
 0011-codecache-keep-the-main-dispatcher-config-when-c.patch
 0012-windows-log-the-code-cache-load-phases-and-pre-t.patch
 0013-windows-honor-extendedvolatilemetadata-ranges-and-wh.patch
+0014-codemap-record-indirect-jump-and-call-targets.patch
